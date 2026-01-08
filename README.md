@@ -5,6 +5,7 @@ Peripheral contracts for the DStock ecosystem, providing LayerZero-integrated br
 ## Overview
 
 This repository contains contracts that enable:
+
 - **One-click wrap and bridge**: Wrap underlying tokens and bridge them to destination chains in a single transaction
 - **Automatic unwrapping**: Composed messages trigger automatic unwrapping of dStock tokens upon arrival at destination
 
@@ -28,11 +29,13 @@ forge install
 ## Usage
 
 ### Compile
+
 ```bash
 forge build
 ```
 
 ### Test
+
 ```bash
 forge test
 ```
@@ -63,7 +66,3 @@ forge script script/DeployUnwrapComposer.s.sol:DeployUnwrapComposer \
   --broadcast \
   --verify
 ```
-
-## Documentation
-
-For detailed documentation, see [.local/PROJECT.md](.local/PROJECT.md)
