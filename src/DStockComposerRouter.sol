@@ -4,7 +4,6 @@ pragma solidity ^0.8.26;
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -103,7 +102,6 @@ contract DStockComposerRouter is
     Initializable,
     UUPSUpgradeable,
     OwnableUpgradeable,
-    PausableUpgradeable,
     ReentrancyGuardUpgradeable,
     IOAppComposer
 {
@@ -113,28 +111,24 @@ contract DStockComposerRouter is
     /// @notice BSC EndpointV2 address
     address public endpoint;
 
-    /// @notice OApp/Adapter address -> asset config ID
-    mapping(address => bytes32) public oAppToConfigId;
+    /// @notice The LayerZero endpoint ID (eid) of the chain this router is deployed on.
+    uint32 public chainEid;
 
-    struct AssetConfig {
-        bool isSet;
-        bool deprecated;
-        address underlyingOft; // token OFT on BSC
-        address wrapper; // share ERC20 + wrap/unwrap
-        address shareAdapter; // OFT adapter for shares
-        bool forwardPaused;
-        bool reversePaused;
-        uint8 sharedDecimals; // optional (dust handling / normalization)
-    }
+    /// @notice OFT underlying -> wrapper (shares token + wrap/unwrap interface).
+    mapping(address => address) public underlyingOftToWrapper;
 
-    mapping(bytes32 => AssetConfig) public assetConfigs;
+    /// @notice OFT underlying -> shareAdapter (OFT adapter for shares to HyperEVM).
+    mapping(address => address) public underlyingOftToShareAdapter;
+
+    /// @notice shareAdapter -> wrapper.
+    mapping(address => address) public shareAdapterToWrapper;
+
     mapping(bytes32 => bool) public processedGuids;
 
     uint256[50] private __gap;
 
-    event AssetAdded(bytes32 indexed configId, address indexed underlyingOft, address indexed wrapper, address shareAdapter, uint8 sharedDecimals);
-    event AssetDeprecated(bytes32 indexed configId);
-    event AssetPauseSet(bytes32 indexed configId, bool forwardPaused, bool reversePaused);
+    event UnderlyingOftConfigSet(address indexed underlyingOft, address indexed wrapper, address indexed shareAdapter);
+    event ShareAdapterWrapperSet(address indexed shareAdapter, address indexed wrapper);
 
     event WrappedAndForwarded(bytes32 indexed guid, uint32 finalDstEid, bytes32 finalTo, uint256 underlyingIn, uint256 sharesOut);
     event UnwrappedAndForwarded(bytes32 indexed guid, uint32 finalDstEid, bytes32 finalTo, uint256 sharesIn, uint256 underlyingOut);
@@ -144,8 +138,6 @@ contract DStockComposerRouter is
     error ZeroAddress();
     error NotEndpoint();
     error InvalidOApp();
-    error AlreadyRegistered(address oApp);
-    error UnknownConfig(bytes32 configId);
     error InvalidRefundAddress();
 
     struct RouteMsg {
@@ -156,6 +148,7 @@ contract DStockComposerRouter is
     }
 
     struct ReverseRouteMsg {
+        address underlyingOft;
         uint32 finalDstEid;
         bytes32 finalTo;
         address refundBsc;
@@ -165,72 +158,33 @@ contract DStockComposerRouter is
         bytes composeMsg2;
     }
 
-    function initialize(address _endpoint, address _owner) external initializer {
+    function initialize(address _endpoint, uint32 _chainEid, address _owner) external initializer {
         if (_endpoint == address(0) || _owner == address(0)) revert ZeroAddress();
         __Ownable_init(_owner);
-        __Pausable_init();
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
         endpoint = _endpoint;
+        chainEid = _chainEid;
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    function pause() external onlyOwner {
-        _pause();
-    }
 
-    function unpause() external onlyOwner {
-        _unpause();
-    }
+    /// @notice Configure routing mappings in one call.
+    /// @dev Always registers the reverse mapping `shareAdapter -> wrapper`.
+    /// If `underlyingOft != address(0)`, also registers forward mappings `underlyingOft -> (wrapper, shareAdapter)`.
+    function setRouteConfig(address underlyingOft, address wrapper, address shareAdapter) public onlyOwner {
+        if (wrapper == address(0) || shareAdapter == address(0)) revert ZeroAddress();
 
-    function addAsset(address _underlyingOft, address _wrapper, address _shareAdapter, uint8 _sharedDecimals)
-        external
-        onlyOwner
-        returns (bytes32 configId)
-    {
-        if (_underlyingOft == address(0) || _wrapper == address(0) || _shareAdapter == address(0)) revert ZeroAddress();
-        if (oAppToConfigId[_underlyingOft] != bytes32(0)) revert AlreadyRegistered(_underlyingOft);
-        if (oAppToConfigId[_shareAdapter] != bytes32(0)) revert AlreadyRegistered(_shareAdapter);
+        shareAdapterToWrapper[shareAdapter] = wrapper;
+        emit ShareAdapterWrapperSet(shareAdapter, wrapper);
 
-        configId = keccak256(abi.encodePacked(_underlyingOft, _wrapper, _shareAdapter));
-
-        AssetConfig storage cfg = assetConfigs[configId];
-        cfg.isSet = true;
-        cfg.deprecated = false;
-        cfg.underlyingOft = _underlyingOft;
-        cfg.wrapper = _wrapper;
-        cfg.shareAdapter = _shareAdapter;
-        cfg.forwardPaused = false;
-        cfg.reversePaused = false;
-        cfg.sharedDecimals = _sharedDecimals;
-
-        oAppToConfigId[_underlyingOft] = configId;
-        oAppToConfigId[_shareAdapter] = configId;
-
-        emit AssetAdded(configId, _underlyingOft, _wrapper, _shareAdapter, _sharedDecimals);
-    }
-
-    function deprecateAsset(bytes32 configId) external onlyOwner {
-        AssetConfig storage cfg = assetConfigs[configId];
-        if (!cfg.isSet) revert UnknownConfig(configId);
-        cfg.deprecated = true;
-        cfg.forwardPaused = true;
-        cfg.reversePaused = true;
-
-        if (oAppToConfigId[cfg.underlyingOft] == configId) oAppToConfigId[cfg.underlyingOft] = bytes32(0);
-        if (oAppToConfigId[cfg.shareAdapter] == configId) oAppToConfigId[cfg.shareAdapter] = bytes32(0);
-
-        emit AssetDeprecated(configId);
-    }
-
-    function setAssetPause(bytes32 configId, bool forwardPaused_, bool reversePaused_) external onlyOwner {
-        AssetConfig storage cfg = assetConfigs[configId];
-        if (!cfg.isSet) revert UnknownConfig(configId);
-        cfg.forwardPaused = forwardPaused_;
-        cfg.reversePaused = reversePaused_;
-        emit AssetPauseSet(configId, forwardPaused_, reversePaused_);
+        if (underlyingOft != address(0)) {
+            underlyingOftToWrapper[underlyingOft] = wrapper;
+            underlyingOftToShareAdapter[underlyingOft] = shareAdapter;
+            emit UnderlyingOftConfigSet(underlyingOft, wrapper, shareAdapter);
+        }
     }
 
     function lzCompose(
@@ -241,117 +195,145 @@ contract DStockComposerRouter is
         bytes calldata /*_extraData*/
     ) external payable nonReentrant {
         if (msg.sender != endpoint) revert NotEndpoint();
-        if (processedGuids[_guid]) return; // do not revert (avoid blocking)
+        if (processedGuids[_guid]) return;
         processedGuids[_guid] = true;
 
-        bytes32 configId = oAppToConfigId[_oApp];
-        if (configId == bytes32(0)) revert InvalidOApp();
-
-        AssetConfig storage cfg = assetConfigs[configId];
-        if (!cfg.isSet || cfg.deprecated) revert InvalidOApp();
-
         bytes memory inner = _message.composeMsg();
+        uint256 amountLD = _message.amountLD();
 
-        if (_oApp == cfg.underlyingOft) {
-            uint256 underlyingAmount = _message.amountLD();
-
-            RouteMsg memory r;
-            try this._decodeRouteMsg(inner) returns (RouteMsg memory rr) {
-                r = rr;
-            } catch {
-                _fail(_guid, "decode_route_failed", address(0), underlyingAmount);
-                return;
-            }
-            if (r.refundBsc == address(0)) {
-                _fail(_guid, "refund_zero", address(0), underlyingAmount);
-                return;
-            }
-
-            if (paused() || cfg.forwardPaused) {
-                _refundToken(cfg.underlyingOft, _guid, "paused", r.refundBsc, underlyingAmount);
-                return;
-            }
-
-            uint256 sharesOut = _wrapUnderlying(cfg, _guid, underlyingAmount, r.refundBsc);
-            if (sharesOut == 0) return;
-
-            bool ok = _sendShares(cfg, _guid, underlyingAmount, sharesOut, r);
-            if (!ok) return;
-
-            _refundNative(r.refundBsc);
+        // Reverse: _oApp is a supported shareAdapter
+        address wrapper = shareAdapterToWrapper[_oApp];
+        if (wrapper != address(0)) {
+            _lzComposeReverse(wrapper, _guid, amountLD, inner);
             return;
         }
 
-        if (_oApp == cfg.shareAdapter) {
-            uint256 sharesIn = _message.amountLD();
+        // Forward: _oApp is the OFT underlying
+        address shareAdapter = underlyingOftToShareAdapter[_oApp];
+        wrapper = underlyingOftToWrapper[_oApp];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
 
-            ReverseRouteMsg memory r;
-            try this._decodeReverseRouteMsg(inner) returns (ReverseRouteMsg memory rr) {
-                r = rr;
-            } catch {
-                _fail(_guid, "decode_reverse_route_failed", address(0), sharesIn);
-                return;
-            }
-            if (r.refundBsc == address(0)) {
-                _fail(_guid, "refund_zero", address(0), sharesIn);
-                return;
-            }
-            if (r.unwrapBps == 0 || r.unwrapBps > 10_000) {
-                _refundToken(cfg.wrapper, _guid, "bad_unwrap_bps", r.refundBsc, sharesIn);
-                return;
-            }
-
-            if (paused() || cfg.reversePaused) {
-                _refundToken(cfg.wrapper, _guid, "paused", r.refundBsc, sharesIn);
-                return;
-            }
-
-            uint256 underlyingOut = _unwrapShares(cfg, _guid, sharesIn, r);
-            if (underlyingOut == 0) return;
-
-            bool ok2 = _sendUnderlyingToFinal(cfg, _guid, sharesIn, underlyingOut, r);
-            if (!ok2) return;
-
-            _refundNative(r.refundBsc);
-            return;
-        }
-
-        revert InvalidOApp();
+        _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
     }
 
-    function _wrapUnderlying(AssetConfig storage cfg, bytes32 guid, uint256 underlyingAmount, address refundBsc)
+    function _lzComposeForward(
+        address underlyingOft,
+        address wrapper,
+        address shareAdapter,
+        bytes32 guid,
+        uint256 underlyingAmount,
+        bytes memory inner
+    ) internal {
+        RouteMsg memory r;
+        try this._decodeRouteMsg(inner) returns (RouteMsg memory rr) {
+            r = rr;
+        } catch {
+            _fail(guid, "decode_route_failed", address(0), underlyingAmount);
+            return;
+        }
+        if (r.refundBsc == address(0)) {
+            _fail(guid, "refund_zero", address(0), underlyingAmount);
+            return;
+        }
+
+        uint256 sharesOut = _wrapUnderlying(wrapper, underlyingOft, guid, underlyingAmount, r.refundBsc);
+        if (sharesOut == 0) return;
+
+        bool ok = _sendShares(wrapper, shareAdapter, guid, underlyingAmount, sharesOut, r.finalDstEid, r.finalTo, r.refundBsc, r.minAmountLD2);
+        if (!ok) return;
+
+        _refundNative(r.refundBsc);
+    }
+
+    function _lzComposeReverse(address wrapper, bytes32 guid, uint256 sharesIn, bytes memory inner) internal {
+        ReverseRouteMsg memory r;
+        try this._decodeReverseRouteMsg(inner) returns (ReverseRouteMsg memory rr) {
+            r = rr;
+        } catch {
+            _fail(guid, "decode_reverse_route_failed", address(0), sharesIn);
+            return;
+        }
+        if (r.refundBsc == address(0)) {
+            _fail(guid, "refund_zero", address(0), sharesIn);
+            return;
+        }
+        if (r.underlyingOft == address(0)) {
+            _refundToken(wrapper, guid, "underlying_zero", r.refundBsc, sharesIn);
+            return;
+        }
+        if (r.unwrapBps == 0 || r.unwrapBps > 10_000) {
+            _refundToken(wrapper, guid, "bad_unwrap_bps", r.refundBsc, sharesIn);
+            return;
+        }
+
+        uint256 underlyingOut = _unwrapShares(wrapper, r.underlyingOft, guid, sharesIn, r.refundBsc, r.unwrapBps);
+        if (underlyingOut == 0) return;
+
+        if (r.finalDstEid == chainEid) {
+            address receiver = address(uint160(uint256(r.finalTo)));
+            if (receiver == address(0)) {
+                _refundToken(r.underlyingOft, guid, "receiver_zero", r.refundBsc, underlyingOut);
+                return;
+            }
+            uint256 minUnderlying = r.minAmountLD2 == 0 ? underlyingOut : r.minAmountLD2;
+            if (underlyingOut < minUnderlying) {
+                _refundToken(r.underlyingOft, guid, "underlying_below_min", r.refundBsc, underlyingOut);
+                return;
+            }
+            bool okDeliver = _tryTransfer(r.underlyingOft, receiver, underlyingOut);
+            if (!okDeliver) {
+                _refundToken(r.underlyingOft, guid, "deliver_failed", r.refundBsc, underlyingOut);
+                return;
+            }
+            emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
+        } else {
+            bool ok2 = _sendUnderlyingToFinal(r.underlyingOft, guid, sharesIn, underlyingOut, r);
+            if (!ok2) return;
+        }
+
+        _refundNative(r.refundBsc);
+    }
+
+    function _wrapUnderlying(address wrapper, address underlyingOft, bytes32 guid, uint256 underlyingAmount, address refundBsc)
         internal
         returns (uint256)
     {
-        uint256 balUnderlying = IERC20(cfg.underlyingOft).balanceOf(address(this));
+        uint256 balUnderlying = IERC20(underlyingOft).balanceOf(address(this));
         if (balUnderlying < underlyingAmount) {
-            _refundToken(cfg.underlyingOft, guid, "insufficient_underlying", refundBsc, underlyingAmount);
+            _refundToken(underlyingOft, guid, "insufficient_underlying", refundBsc, underlyingAmount);
             return 0;
         }
 
-        IERC20(cfg.underlyingOft).forceApprove(cfg.wrapper, underlyingAmount);
+        IERC20(underlyingOft).forceApprove(wrapper, underlyingAmount);
 
-        uint256 shareBalBefore = IERC20(cfg.wrapper).balanceOf(address(this));
-        IDStockWrapperLike(cfg.wrapper).wrap(cfg.underlyingOft, underlyingAmount, address(this));
-        uint256 shareBalAfter = IERC20(cfg.wrapper).balanceOf(address(this));
+        uint256 shareBalBefore = IERC20(wrapper).balanceOf(address(this));
+        IDStockWrapperLike(wrapper).wrap(underlyingOft, underlyingAmount, address(this));
+        uint256 shareBalAfter = IERC20(wrapper).balanceOf(address(this));
         uint256 sharesOut = shareBalAfter - shareBalBefore;
 
         if (sharesOut == 0) {
-            _refundToken(cfg.underlyingOft, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
+            _refundToken(underlyingOft, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
             return 0;
         }
         return sharesOut;
     }
 
-    function _sendShares(AssetConfig storage cfg, bytes32 guid, uint256 underlyingIn, uint256 sharesOut, RouteMsg memory r)
-        internal
-        returns (bool)
-    {
-        uint256 minShares = r.minAmountLD2 == 0 ? sharesOut : r.minAmountLD2;
+    function _sendShares(
+        address wrapper,
+        address shareAdapter,
+        bytes32 guid,
+        uint256 underlyingIn,
+        uint256 sharesOut,
+        uint32 finalDstEid,
+        bytes32 finalTo,
+        address refundBsc,
+        uint256 minAmountLD2
+    ) internal returns (bool) {
+        uint256 minShares = minAmountLD2 == 0 ? sharesOut : minAmountLD2;
 
         IOFTLike.SendParam memory sp = IOFTLike.SendParam({
-            dstEid: r.finalDstEid,
-            to: r.finalTo,
+            dstEid: finalDstEid,
+            to: finalTo,
             amountLD: sharesOut,
             minAmountLD: minShares,
             extraOptions: "",
@@ -359,19 +341,19 @@ contract DStockComposerRouter is
             oftCmd: ""
         });
 
-        IOFTLike.MessagingFee memory fee2 = IOFTLike(cfg.shareAdapter).quoteSend(sp, false);
+        IOFTLike.MessagingFee memory fee2 = IOFTLike(shareAdapter).quoteSend(sp, false);
         if (address(this).balance < fee2.nativeFee) {
-            _refundToken(cfg.wrapper, guid, "fee_insufficient", r.refundBsc, sharesOut);
+            _refundToken(wrapper, guid, "fee_insufficient", refundBsc, sharesOut);
             return false;
         }
 
-        IERC20(cfg.wrapper).forceApprove(cfg.shareAdapter, sharesOut);
+        IERC20(wrapper).forceApprove(shareAdapter, sharesOut);
 
-        try IOFTLike(cfg.shareAdapter).send{value: fee2.nativeFee}(sp, fee2, r.refundBsc) {
-            emit WrappedAndForwarded(guid, r.finalDstEid, r.finalTo, underlyingIn, sharesOut);
+        try IOFTLike(shareAdapter).send{value: fee2.nativeFee}(sp, fee2, refundBsc) {
+            emit WrappedAndForwarded(guid, finalDstEid, finalTo, underlyingIn, sharesOut);
             return true;
         } catch {
-            _refundToken(cfg.wrapper, guid, "send2_failed", r.refundBsc, sharesOut);
+            _refundToken(wrapper, guid, "send2_failed", refundBsc, sharesOut);
             return false;
         }
     }
@@ -384,45 +366,45 @@ contract DStockComposerRouter is
         return abi.decode(inner, (ReverseRouteMsg));
     }
 
-    function _unwrapShares(AssetConfig storage cfg, bytes32 guid, uint256 sharesIn, ReverseRouteMsg memory r)
+    function _unwrapShares(address wrapper, address underlyingOft, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
         internal
         returns (uint256)
     {
-        uint256 balShares = IERC20(cfg.wrapper).balanceOf(address(this));
+        uint256 balShares = IERC20(wrapper).balanceOf(address(this));
         if (balShares < sharesIn) {
-            _refundToken(cfg.wrapper, guid, "insufficient_shares", r.refundBsc, sharesIn);
+            _refundToken(wrapper, guid, "insufficient_shares", refundBsc, sharesIn);
             return 0;
         }
 
-        uint256 attemptUnderlying = (sharesIn * uint256(r.unwrapBps)) / 10_000;
+        uint256 attemptUnderlying = (sharesIn * uint256(unwrapBps)) / 10_000;
         if (attemptUnderlying == 0) {
-            _refundToken(cfg.wrapper, guid, "unwrap_zero_amount", r.refundBsc, sharesIn);
+            _refundToken(wrapper, guid, "unwrap_zero_amount", refundBsc, sharesIn);
             return 0;
         }
 
-        uint256 underlyingBalBefore = IERC20(cfg.underlyingOft).balanceOf(address(this));
+        uint256 underlyingBalBefore = IERC20(underlyingOft).balanceOf(address(this));
 
-        try IDStockWrapperLike(cfg.wrapper).unwrap(cfg.underlyingOft, attemptUnderlying, address(this)) {} catch {
-            _refundToken(cfg.wrapper, guid, "unwrap_failed", r.refundBsc, sharesIn);
+        try IDStockWrapperLike(wrapper).unwrap(underlyingOft, attemptUnderlying, address(this)) {} catch {
+            _refundToken(wrapper, guid, "unwrap_failed", refundBsc, sharesIn);
             return 0;
         }
 
-        uint256 underlyingBalAfter = IERC20(cfg.underlyingOft).balanceOf(address(this));
+        uint256 underlyingBalAfter = IERC20(underlyingOft).balanceOf(address(this));
         uint256 underlyingOut = underlyingBalAfter - underlyingBalBefore;
         if (underlyingOut == 0) {
-            _refundToken(cfg.wrapper, guid, "unwrap_zero_out", r.refundBsc, sharesIn);
+            _refundToken(wrapper, guid, "unwrap_zero_out", refundBsc, sharesIn);
             return 0;
         }
         return underlyingOut;
     }
 
-    function _sendUnderlyingToFinal(AssetConfig storage cfg, bytes32 guid, uint256 sharesIn, uint256 underlyingOut, ReverseRouteMsg memory r)
+    function _sendUnderlyingToFinal(address underlyingOft, bytes32 guid, uint256 sharesIn, uint256 underlyingOut, ReverseRouteMsg memory r)
         internal
         returns (bool)
     {
         uint256 minUnderlying = r.minAmountLD2 == 0 ? underlyingOut : r.minAmountLD2;
         if (underlyingOut < minUnderlying) {
-            _refundToken(cfg.underlyingOft, guid, "underlying_below_min", r.refundBsc, underlyingOut);
+            _refundToken(underlyingOft, guid, "underlying_below_min", r.refundBsc, underlyingOut);
             return false;
         }
 
@@ -436,21 +418,20 @@ contract DStockComposerRouter is
             oftCmd: ""
         });
 
-        IOFTLike.MessagingFee memory fee2 = IOFTLike(cfg.underlyingOft).quoteSend(sp, false);
+        IOFTLike.MessagingFee memory fee2 = IOFTLike(underlyingOft).quoteSend(sp, false);
         if (address(this).balance < fee2.nativeFee) {
-            _refundToken(cfg.underlyingOft, guid, "fee_insufficient", r.refundBsc, underlyingOut);
+            _refundToken(underlyingOft, guid, "fee_insufficient", r.refundBsc, underlyingOut);
             return false;
         }
 
-        try IOFTLike(cfg.underlyingOft).send{value: fee2.nativeFee}(sp, fee2, r.refundBsc) {
+        try IOFTLike(underlyingOft).send{value: fee2.nativeFee}(sp, fee2, r.refundBsc) {
             emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
             return true;
         } catch {
-            _refundToken(cfg.underlyingOft, guid, "send2_failed", r.refundBsc, underlyingOut);
+            _refundToken(underlyingOft, guid, "send2_failed", r.refundBsc, underlyingOut);
             return false;
         }
     }
-
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(to, amount);
     }

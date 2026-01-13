@@ -14,13 +14,13 @@ contract DeployComposerRouterProxy is Script {
         uint256 adminPk = vm.envUint("ADMIN_PK");
 
         address endpoint = vm.envAddress("ENDPOINT_ADDRESS");
+        uint32 chainEid = uint32(vm.envUint("CHAIN_EID"));
         address owner = vm.envAddress("OWNER_ADDRESS");
 
-        // optional: initial asset registration
-        address underlyingOft = vm.envOr("UNDERLYING_OFT_ADDRESS", address(0));
+        // optional: initial route registration
         address wrapper = vm.envOr("WRAPPER_ADDRESS", address(0));
         address shareAdapter = vm.envOr("SHARE_ADAPTER_ADDRESS", address(0));
-        uint256 sharedDecimals = vm.envOr("SHARED_DECIMALS", uint256(0));
+        address underlyingOft = vm.envOr("UNDERLYING_OFT_ADDRESS", address(0));
 
         vm.startBroadcast(adminPk);
 
@@ -28,17 +28,13 @@ contract DeployComposerRouterProxy is Script {
         DStockComposerRouter impl = new DStockComposerRouter();
 
         // 2) deploy proxy + initialize
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (endpoint, owner));
+        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (endpoint, chainEid, owner));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
 
-        // 3) optional: register one asset
-        if (underlyingOft != address(0) && wrapper != address(0) && shareAdapter != address(0)) {
-            DStockComposerRouter(payable(address(proxy))).addAsset(
-                underlyingOft,
-                wrapper,
-                shareAdapter,
-                uint8(sharedDecimals)
-            );
+        // 3) optional: register minimal mappings
+        if (wrapper != address(0) && shareAdapter != address(0)) {
+            DStockComposerRouter router = DStockComposerRouter(payable(address(proxy)));
+            router.setRouteConfig(underlyingOft, wrapper, shareAdapter);
         }
 
         vm.stopBroadcast();
@@ -46,12 +42,12 @@ contract DeployComposerRouterProxy is Script {
         console2.log("DStockComposerRouter implementation:", address(impl));
         console2.log("DStockComposerRouter proxy:", address(proxy));
         console2.log("Endpoint:", endpoint);
+        console2.log("ChainEid:", chainEid);
         console2.log("Owner:", owner);
-        if (underlyingOft != address(0)) {
-            console2.log("Initial underlyingOft:", underlyingOft);
+        if (wrapper != address(0) && shareAdapter != address(0)) {
             console2.log("Initial wrapper:", wrapper);
             console2.log("Initial shareAdapter:", shareAdapter);
-            console2.log("sharedDecimals:", sharedDecimals);
+            if (underlyingOft != address(0)) console2.log("Initial underlyingOft:", underlyingOft);
         }
     }
 }

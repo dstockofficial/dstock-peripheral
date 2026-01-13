@@ -42,5 +42,12 @@ contract MockComposerWrapper is ERC20, IDStockWrapperLike {
         uint256 amountToken = amount18 / (10 ** (18 - uDec));
         require(IERC20(token).transfer(to, amountToken), "push_underlying_failed");
     }
+
+    function previewWrap(address token, uint256 amount) external view returns (uint256 net18, uint256 fee) {
+        uint8 uDec = underlyingDecimals[token];
+        if (uDec == 0 || uDec > 18) return (0, 0);
+        net18 = amount * (10 ** (18 - uDec));
+        return (net18, 0);
+    }
 }
 

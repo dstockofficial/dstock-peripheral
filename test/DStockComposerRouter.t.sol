@@ -13,6 +13,7 @@ import {MockComposerWrapper} from "./mocks/MockComposerWrapper.sol";
 contract DStockComposerRouterTest is Test {
     address internal constant ENDPOINT = address(0xE11D);
     address internal constant REFUND = address(0xBEEF);
+    uint32 internal constant CHAIN_EID = 12345;
 
     DStockComposerRouter internal router;
     DStockComposerRouter internal impl;
@@ -21,12 +22,10 @@ contract DStockComposerRouterTest is Test {
     MockComposerWrapper internal wrapper;
     MockOFTLikeAdapter internal shareAdapter;
 
-    bytes32 internal configId;
-
     function setUp() public {
         // deploy implementation + proxy and initialize
         impl = new DStockComposerRouter();
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, address(this)));
+        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(this)));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         router = DStockComposerRouter(payable(address(proxy)));
 
@@ -37,7 +36,7 @@ contract DStockComposerRouterTest is Test {
 
         shareAdapter = new MockOFTLikeAdapter(address(wrapper));
 
-        configId = router.addAsset(address(underlyingOft), address(wrapper), address(shareAdapter), 18);
+        router.setRouteConfig(address(underlyingOft), address(wrapper), address(shareAdapter));
     }
 
     function _compose(bytes32 guid, uint256 amountLD, bytes memory inner) internal pure returns (bytes32, bytes memory) {
@@ -47,34 +46,13 @@ contract DStockComposerRouterTest is Test {
 
     function test_initialize_onlyOnce() public {
         vm.expectRevert();
-        router.initialize(ENDPOINT, address(this));
+        router.initialize(ENDPOINT, CHAIN_EID, address(this));
     }
 
-    function test_addAsset_writesMappings() public view {
-        bytes32 got1 = router.oAppToConfigId(address(underlyingOft));
-        bytes32 got2 = router.oAppToConfigId(address(shareAdapter));
-        assertEq(got1, configId);
-        assertEq(got2, configId);
-
-        (
-            bool isSet,
-            bool deprecated,
-            address u,
-            address w,
-            address a,
-            bool forwardPaused,
-            bool reversePaused,
-            uint8 sharedDecimals
-        ) = router.assetConfigs(configId);
-
-        assertTrue(isSet);
-        assertFalse(deprecated);
-        assertEq(u, address(underlyingOft));
-        assertEq(w, address(wrapper));
-        assertEq(a, address(shareAdapter));
-        assertFalse(forwardPaused);
-        assertFalse(reversePaused);
-        assertEq(sharedDecimals, 18);
+    function test_registryMappings_written() public view {
+        assertEq(router.underlyingOftToWrapper(address(underlyingOft)), address(wrapper));
+        assertEq(router.underlyingOftToShareAdapter(address(underlyingOft)), address(shareAdapter));
+        assertEq(router.shareAdapterToWrapper(address(shareAdapter)), address(wrapper));
     }
 
     function test_lzCompose_forward_success() public {
@@ -102,23 +80,7 @@ contract DStockComposerRouterTest is Test {
         assertEq(wrapper.balanceOf(address(router)), 0);
     }
 
-    function test_lzCompose_forward_paused_refunds() public {
-        uint256 amountUnderlying = 500e6;
-        underlyingOft.mint(address(router), amountUnderlying);
-
-        router.setAssetPause(configId, true, false);
-
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(uint160(address(0xCAFE)))), refundBsc: REFUND, minAmountLD2: 0});
-        (, bytes memory message) = _compose(bytes32("guid2"), amountUnderlying, abi.encode(r));
-
-        vm.prank(ENDPOINT);
-        router.lzCompose(address(underlyingOft), bytes32("guid2"), message, address(0), "");
-
-        // underlying refunded to REFUND, not wrapped
-        assertEq(underlyingOft.balanceOf(REFUND), amountUnderlying);
-        assertEq(underlyingOft.balanceOf(address(wrapper)), 0);
-    }
+    // pause behavior removed in minimal-mapping router
 
     function test_lzCompose_guid_idempotent_doesNotDoubleProcess() public {
         uint256 amountUnderlying = 100e6;
@@ -159,6 +121,7 @@ contract DStockComposerRouterTest is Test {
         vm.deal(address(router), 1 ether);
 
         DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlyingOft: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
@@ -176,6 +139,39 @@ contract DStockComposerRouterTest is Test {
         // shares should be burned from router during unwrap, underlying burned during send
         assertEq(wrapper.balanceOf(address(router)), 0);
         assertEq(underlyingOft.balanceOf(address(router)), 0);
+    }
+
+    function test_lzCompose_reverse_deliverLocal_whenFinalDstIsChainEid() public {
+        address receiver = address(0xCAFE);
+
+        // Give wrapper underlying liquidity to return on unwrap
+        uint256 underlyingLiquidity = 2000e6;
+        underlyingOft.mint(address(wrapper), underlyingLiquidity);
+
+        // Credit router shares as if shareAdapter delivered them
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlyingOft: address(underlyingOft),
+            finalDstEid: CHAIN_EID,
+            finalTo: bytes32(uint256(uint160(receiver))),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+
+        (, bytes memory message) = _compose(bytes32("guidLocal"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidLocal"), message, address(0), "");
+
+        // Delivered locally: receiver got underlying, router holds none
+        assertEq(wrapper.balanceOf(address(router)), 0);
+        assertEq(underlyingOft.balanceOf(address(router)), 0);
+        assertGt(underlyingOft.balanceOf(receiver), 0);
     }
 }
 
