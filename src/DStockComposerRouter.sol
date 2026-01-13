@@ -73,6 +73,11 @@ interface IDStockWrapperLike {
     function unwrap(address token, uint256 amount, address to) external;
 }
 
+/// @dev Optional wrapper view interface (used for fee quoting on user wraps).
+interface IDStockWrapperPreview {
+    function previewWrap(address token, uint256 amount) external view returns (uint256 net18, uint256 fee);
+}
+
 /**
  * @dev LayerZero v2 compose interface (executor calls this via EndpointV2).
  */
@@ -90,8 +95,8 @@ interface IOAppComposer {
  * @title DStockComposerRouter
  * @notice UUPS-upgradeable, multi-asset LayerZero compose-driven two-hop router on BSC.
  *
- * - Forward: receives `underlyingOft` (credited on lzReceive) -> wraps into `wrapper` shares -> sends shares via `shareAdapter`.
- * - Reverse: receives wrapper shares via `shareAdapter` -> unwraps into `underlyingOft` -> sends underlying to the final chain.
+ * - Forward: receives `underlying` (credited on lzReceive) -> wraps into `wrapper` shares -> sends shares via `shareAdapter`.
+ * - Reverse: receives wrapper shares via `shareAdapter` -> unwraps into `underlying` -> sends underlying to the final chain.
  *
  * Key safety properties:
  * - GUID idempotency (processedGuids)
@@ -114,11 +119,11 @@ contract DStockComposerRouter is
     /// @notice The LayerZero endpoint ID (eid) of the chain this router is deployed on.
     uint32 public chainEid;
 
-    /// @notice OFT underlying -> wrapper (shares token + wrap/unwrap interface).
-    mapping(address => address) public underlyingOftToWrapper;
+    /// @notice underlying token (either OFT or local ERC20) -> wrapper (shares token + wrap/unwrap interface).
+    mapping(address => address) public underlyingToWrapper;
 
-    /// @notice OFT underlying -> shareAdapter (OFT adapter for shares to HyperEVM).
-    mapping(address => address) public underlyingOftToShareAdapter;
+    /// @notice underlying token (either OFT or local ERC20) -> shareAdapter (OFT adapter for shares to HyperEVM).
+    mapping(address => address) public underlyingToShareAdapter;
 
     /// @notice shareAdapter -> wrapper.
     mapping(address => address) public shareAdapterToWrapper;
@@ -127,7 +132,7 @@ contract DStockComposerRouter is
 
     uint256[50] private __gap;
 
-    event UnderlyingOftConfigSet(address indexed underlyingOft, address indexed wrapper, address indexed shareAdapter);
+    event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
     event ShareAdapterWrapperSet(address indexed shareAdapter, address indexed wrapper);
 
     event WrappedAndForwarded(bytes32 indexed guid, uint32 finalDstEid, bytes32 finalTo, uint256 underlyingIn, uint256 sharesOut);
@@ -139,6 +144,10 @@ contract DStockComposerRouter is
     error NotEndpoint();
     error InvalidOApp();
     error InvalidRefundAddress();
+    error AmountZero();
+    error InvalidRecipient();
+    error InsufficientFee(uint256 provided, uint256 required);
+    error RefundFailedNative();
 
     struct RouteMsg {
         uint32 finalDstEid;
@@ -148,7 +157,7 @@ contract DStockComposerRouter is
     }
 
     struct ReverseRouteMsg {
-        address underlyingOft;
+        address underlying;
         uint32 finalDstEid;
         bytes32 finalTo;
         address refundBsc;
@@ -173,18 +182,98 @@ contract DStockComposerRouter is
 
     /// @notice Configure routing mappings in one call.
     /// @dev Always registers the reverse mapping `shareAdapter -> wrapper`.
-    /// If `underlyingOft != address(0)`, also registers forward mappings `underlyingOft -> (wrapper, shareAdapter)`.
-    function setRouteConfig(address underlyingOft, address wrapper, address shareAdapter) public onlyOwner {
+    /// If `underlying != address(0)`, also registers forward mappings `underlying -> (wrapper, shareAdapter)`.
+    function setRouteConfig(address underlying, address wrapper, address shareAdapter) public onlyOwner {
         if (wrapper == address(0) || shareAdapter == address(0)) revert ZeroAddress();
 
         shareAdapterToWrapper[shareAdapter] = wrapper;
         emit ShareAdapterWrapperSet(shareAdapter, wrapper);
 
-        if (underlyingOft != address(0)) {
-            underlyingOftToWrapper[underlyingOft] = wrapper;
-            underlyingOftToShareAdapter[underlyingOft] = shareAdapter;
-            emit UnderlyingOftConfigSet(underlyingOft, wrapper, shareAdapter);
+        if (underlying != address(0)) {
+            underlyingToWrapper[underlying] = wrapper;
+            underlyingToShareAdapter[underlying] = shareAdapter;
+            emit UnderlyingConfigSet(underlying, wrapper, shareAdapter);
         }
+    }
+
+    /// @notice User entry: wrap an underlying token into wrapper shares and bridge shares via shareAdapter.
+    /// @dev Uses the same registry as compose-forward; `underlying` can be an OFT token or a local ERC20.
+    function wrapAndBridge(
+        address underlying,
+        uint256 amount,
+        uint32 dstEid,
+        bytes32 to,
+        bytes calldata extraOptions
+    ) external payable nonReentrant returns (uint256 amountSentLD) {
+        if (amount == 0) revert AmountZero();
+        if (to == bytes32(0)) revert InvalidRecipient();
+
+        address wrapper = underlyingToWrapper[underlying];
+        address shareAdapter = underlyingToShareAdapter[underlying];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+        IERC20(underlying).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(underlying).forceApprove(wrapper, amount);
+
+        (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(underlying, amount, address(this));
+        amountSentLD = net18;
+        if (amountSentLD == 0) revert AmountZero();
+
+        IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
+
+        IOFTLike.SendParam memory sp = IOFTLike.SendParam({
+            dstEid: dstEid,
+            to: to,
+            amountLD: amountSentLD,
+            minAmountLD: amountSentLD,
+            extraOptions: extraOptions,
+            composeMsg: "",
+            oftCmd: ""
+        });
+
+        IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
+        if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
+
+        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+
+        uint256 refund = msg.value - fee.nativeFee;
+        if (refund > 0) {
+            (bool ok, ) = msg.sender.call{value: refund}("");
+            if (!ok) revert RefundFailedNative();
+        }
+    }
+
+    /// @notice Quote the LayerZero fee for user wrap + bridge.
+    /// @dev Requires wrapper to implement `previewWrap`.
+    function quoteWrapAndBridge(
+        address underlying,
+        uint256 amount,
+        uint32 dstEid,
+        bytes32 to,
+        bytes calldata extraOptions
+    ) external view returns (uint256 nativeFee) {
+        if (amount == 0) revert AmountZero();
+        if (to == bytes32(0)) revert InvalidRecipient();
+
+        address wrapper = underlyingToWrapper[underlying];
+        address shareAdapter = underlyingToShareAdapter[underlying];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+        (uint256 estimatedNet18, ) = IDStockWrapperPreview(wrapper).previewWrap(underlying, amount);
+        if (estimatedNet18 == 0) revert AmountZero();
+
+        IOFTLike.SendParam memory sp = IOFTLike.SendParam({
+            dstEid: dstEid,
+            to: to,
+            amountLD: estimatedNet18,
+            minAmountLD: estimatedNet18,
+            extraOptions: extraOptions,
+            composeMsg: "",
+            oftCmd: ""
+        });
+
+        IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
+        return fee.nativeFee;
     }
 
     function lzCompose(
@@ -208,16 +297,16 @@ contract DStockComposerRouter is
             return;
         }
 
-        // Forward: _oApp is the OFT underlying
-        address shareAdapter = underlyingOftToShareAdapter[_oApp];
-        wrapper = underlyingOftToWrapper[_oApp];
+        // Forward: _oApp is the underlying token (OFT or local ERC20) that was credited to this router
+        address shareAdapter = underlyingToShareAdapter[_oApp];
+        wrapper = underlyingToWrapper[_oApp];
         if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
 
         _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
     }
 
     function _lzComposeForward(
-        address underlyingOft,
+        address underlying,
         address wrapper,
         address shareAdapter,
         bytes32 guid,
@@ -236,7 +325,7 @@ contract DStockComposerRouter is
             return;
         }
 
-        uint256 sharesOut = _wrapUnderlying(wrapper, underlyingOft, guid, underlyingAmount, r.refundBsc);
+        uint256 sharesOut = _wrapUnderlying(wrapper, underlying, guid, underlyingAmount, r.refundBsc);
         if (sharesOut == 0) return;
 
         bool ok = _sendShares(wrapper, shareAdapter, guid, underlyingAmount, sharesOut, r.finalDstEid, r.finalTo, r.refundBsc, r.minAmountLD2);
@@ -257,7 +346,7 @@ contract DStockComposerRouter is
             _fail(guid, "refund_zero", address(0), sharesIn);
             return;
         }
-        if (r.underlyingOft == address(0)) {
+        if (r.underlying == address(0)) {
             _refundToken(wrapper, guid, "underlying_zero", r.refundBsc, sharesIn);
             return;
         }
@@ -266,53 +355,53 @@ contract DStockComposerRouter is
             return;
         }
 
-        uint256 underlyingOut = _unwrapShares(wrapper, r.underlyingOft, guid, sharesIn, r.refundBsc, r.unwrapBps);
+        uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc, r.unwrapBps);
         if (underlyingOut == 0) return;
 
         if (r.finalDstEid == chainEid) {
             address receiver = address(uint160(uint256(r.finalTo)));
             if (receiver == address(0)) {
-                _refundToken(r.underlyingOft, guid, "receiver_zero", r.refundBsc, underlyingOut);
+                _refundToken(r.underlying, guid, "receiver_zero", r.refundBsc, underlyingOut);
                 return;
             }
             uint256 minUnderlying = r.minAmountLD2 == 0 ? underlyingOut : r.minAmountLD2;
             if (underlyingOut < minUnderlying) {
-                _refundToken(r.underlyingOft, guid, "underlying_below_min", r.refundBsc, underlyingOut);
+                _refundToken(r.underlying, guid, "underlying_below_min", r.refundBsc, underlyingOut);
                 return;
             }
-            bool okDeliver = _tryTransfer(r.underlyingOft, receiver, underlyingOut);
+            bool okDeliver = _tryTransfer(r.underlying, receiver, underlyingOut);
             if (!okDeliver) {
-                _refundToken(r.underlyingOft, guid, "deliver_failed", r.refundBsc, underlyingOut);
+                _refundToken(r.underlying, guid, "deliver_failed", r.refundBsc, underlyingOut);
                 return;
             }
             emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
         } else {
-            bool ok2 = _sendUnderlyingToFinal(r.underlyingOft, guid, sharesIn, underlyingOut, r);
+            bool ok2 = _sendUnderlyingToFinal(r.underlying, guid, sharesIn, underlyingOut, r);
             if (!ok2) return;
         }
 
         _refundNative(r.refundBsc);
     }
 
-    function _wrapUnderlying(address wrapper, address underlyingOft, bytes32 guid, uint256 underlyingAmount, address refundBsc)
+    function _wrapUnderlying(address wrapper, address underlying, bytes32 guid, uint256 underlyingAmount, address refundBsc)
         internal
         returns (uint256)
     {
-        uint256 balUnderlying = IERC20(underlyingOft).balanceOf(address(this));
+        uint256 balUnderlying = IERC20(underlying).balanceOf(address(this));
         if (balUnderlying < underlyingAmount) {
-            _refundToken(underlyingOft, guid, "insufficient_underlying", refundBsc, underlyingAmount);
+            _refundToken(underlying, guid, "insufficient_underlying", refundBsc, underlyingAmount);
             return 0;
         }
 
-        IERC20(underlyingOft).forceApprove(wrapper, underlyingAmount);
+        IERC20(underlying).forceApprove(wrapper, underlyingAmount);
 
         uint256 shareBalBefore = IERC20(wrapper).balanceOf(address(this));
-        IDStockWrapperLike(wrapper).wrap(underlyingOft, underlyingAmount, address(this));
+        IDStockWrapperLike(wrapper).wrap(underlying, underlyingAmount, address(this));
         uint256 shareBalAfter = IERC20(wrapper).balanceOf(address(this));
         uint256 sharesOut = shareBalAfter - shareBalBefore;
 
         if (sharesOut == 0) {
-            _refundToken(underlyingOft, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
+            _refundToken(underlying, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
             return 0;
         }
         return sharesOut;
@@ -366,7 +455,7 @@ contract DStockComposerRouter is
         return abi.decode(inner, (ReverseRouteMsg));
     }
 
-    function _unwrapShares(address wrapper, address underlyingOft, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
+    function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
         internal
         returns (uint256)
     {
@@ -382,14 +471,14 @@ contract DStockComposerRouter is
             return 0;
         }
 
-        uint256 underlyingBalBefore = IERC20(underlyingOft).balanceOf(address(this));
+        uint256 underlyingBalBefore = IERC20(underlying).balanceOf(address(this));
 
-        try IDStockWrapperLike(wrapper).unwrap(underlyingOft, attemptUnderlying, address(this)) {} catch {
+        try IDStockWrapperLike(wrapper).unwrap(underlying, attemptUnderlying, address(this)) {} catch {
             _refundToken(wrapper, guid, "unwrap_failed", refundBsc, sharesIn);
             return 0;
         }
 
-        uint256 underlyingBalAfter = IERC20(underlyingOft).balanceOf(address(this));
+        uint256 underlyingBalAfter = IERC20(underlying).balanceOf(address(this));
         uint256 underlyingOut = underlyingBalAfter - underlyingBalBefore;
         if (underlyingOut == 0) {
             _refundToken(wrapper, guid, "unwrap_zero_out", refundBsc, sharesIn);
@@ -398,13 +487,13 @@ contract DStockComposerRouter is
         return underlyingOut;
     }
 
-    function _sendUnderlyingToFinal(address underlyingOft, bytes32 guid, uint256 sharesIn, uint256 underlyingOut, ReverseRouteMsg memory r)
+    function _sendUnderlyingToFinal(address underlying, bytes32 guid, uint256 sharesIn, uint256 underlyingOut, ReverseRouteMsg memory r)
         internal
         returns (bool)
     {
         uint256 minUnderlying = r.minAmountLD2 == 0 ? underlyingOut : r.minAmountLD2;
         if (underlyingOut < minUnderlying) {
-            _refundToken(underlyingOft, guid, "underlying_below_min", r.refundBsc, underlyingOut);
+            _refundToken(underlying, guid, "underlying_below_min", r.refundBsc, underlyingOut);
             return false;
         }
 
@@ -418,17 +507,17 @@ contract DStockComposerRouter is
             oftCmd: ""
         });
 
-        IOFTLike.MessagingFee memory fee2 = IOFTLike(underlyingOft).quoteSend(sp, false);
+        IOFTLike.MessagingFee memory fee2 = IOFTLike(underlying).quoteSend(sp, false);
         if (address(this).balance < fee2.nativeFee) {
-            _refundToken(underlyingOft, guid, "fee_insufficient", r.refundBsc, underlyingOut);
+            _refundToken(underlying, guid, "fee_insufficient", r.refundBsc, underlyingOut);
             return false;
         }
 
-        try IOFTLike(underlyingOft).send{value: fee2.nativeFee}(sp, fee2, r.refundBsc) {
+        try IOFTLike(underlying).send{value: fee2.nativeFee}(sp, fee2, r.refundBsc) {
             emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
             return true;
         } catch {
-            _refundToken(underlyingOft, guid, "send2_failed", r.refundBsc, underlyingOut);
+            _refundToken(underlying, guid, "send2_failed", r.refundBsc, underlyingOut);
             return false;
         }
     }

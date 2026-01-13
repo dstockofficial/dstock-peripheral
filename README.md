@@ -6,13 +6,14 @@ Peripheral contracts for the DStock ecosystem, providing LayerZero-integrated br
 
 This repository contains contracts that enable:
 
-- **One-click wrap and bridge**: Wrap underlying tokens and bridge them to destination chains in a single transaction
-- **Automatic unwrapping**: Composed messages trigger automatic unwrapping of dStock tokens upon arrival at destination
+- **One-click wrap and bridge**: Wrap underlying tokens (BSC-local ERC20 or OFT assets) and bridge shares to destination chains in a single transaction
+- **Automatic unwrapping**: LayerZero compose messages can trigger unwrapping of shares into the configured underlying token (and optionally deliver locally on the same chain)
 
 ## Contracts
 
-- **DStockRouter**: One-click wrap and bridge functionality (BSC → HyperEVM)
-- **DStockUnwrapComposer**: LayerZero compose handler for automatic unwrapping on destination chain
+- **DStockComposerRouter**: Unified router that supports:
+  - user-initiated wrap + bridge (`wrapAndBridge`, `quoteWrapAndBridge`)
+  - LayerZero compose handling for forward and reverse routes (`lzCompose`)
 
 ## Prerequisites
 
@@ -42,26 +43,17 @@ forge test
 
 ### Deploy
 
-#### Deploy Router (Source Chain - BSC)
+#### Deploy DStockComposerRouter (UUPS implementation + proxy)
 
 ```bash
 ADMIN_PK=<deployer_private_key> \
-WRAPPER_ADDRESS=<dstock_wrapper_address> \
-OFT_ADAPTER_ADDRESS=<layerzero_oft_adapter_address> \
-forge script script/DeployRouter.s.sol:DeployRouter \
-  --rpc-url <your_rpc_url> \
-  --broadcast \
-  --verify
-```
-
-#### Deploy Unwrap Composer (Destination Chain - HyperEVM)
-
-```bash
-ADMIN_PK=<deployer_private_key> \
-WRAPPER_ADDRESS=<dstock_wrapper_address> \
-UNDERLYING_ADDRESS=<underlying_token_address> \
-OFT_ADAPTER_ADDRESS=<layerzero_oft_adapter_address> \
-forge script script/DeployUnwrapComposer.s.sol:DeployUnwrapComposer \
+ENDPOINT_ADDRESS=<layerzero_endpoint_v2_address> \
+CHAIN_EID=<this_chain_eid> \
+OWNER_ADDRESS=<router_owner_address> \
+WRAPPER_ADDRESS=<dstock_wrapper_address_optional> \
+SHARE_ADAPTER_ADDRESS=<shares_oft_adapter_address_optional> \
+UNDERLYING_ADDRESS=<underlying_token_address_optional> \
+forge script script/DeployComposerRouterProxy.s.sol:DeployComposerRouterProxy \
   --rpc-url <your_rpc_url> \
   --broadcast \
   --verify

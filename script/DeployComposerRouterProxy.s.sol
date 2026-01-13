@@ -8,7 +8,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 
 import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
 
-/// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouter and optionally registers one asset.
+/// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouter and optionally registers one route.
 contract DeployComposerRouterProxy is Script {
     function run() external {
         uint256 adminPk = vm.envUint("ADMIN_PK");
@@ -20,7 +20,7 @@ contract DeployComposerRouterProxy is Script {
         // optional: initial route registration
         address wrapper = vm.envOr("WRAPPER_ADDRESS", address(0));
         address shareAdapter = vm.envOr("SHARE_ADAPTER_ADDRESS", address(0));
-        address underlyingOft = vm.envOr("UNDERLYING_OFT_ADDRESS", address(0));
+        address underlying = vm.envOr("UNDERLYING_ADDRESS", address(0));
 
         vm.startBroadcast(adminPk);
 
@@ -34,7 +34,7 @@ contract DeployComposerRouterProxy is Script {
         // 3) optional: register minimal mappings
         if (wrapper != address(0) && shareAdapter != address(0)) {
             DStockComposerRouter router = DStockComposerRouter(payable(address(proxy)));
-            router.setRouteConfig(underlyingOft, wrapper, shareAdapter);
+            router.setRouteConfig(underlying, wrapper, shareAdapter);
         }
 
         vm.stopBroadcast();
@@ -47,7 +47,7 @@ contract DeployComposerRouterProxy is Script {
         if (wrapper != address(0) && shareAdapter != address(0)) {
             console2.log("Initial wrapper:", wrapper);
             console2.log("Initial shareAdapter:", shareAdapter);
-            if (underlyingOft != address(0)) console2.log("Initial underlyingOft:", underlyingOft);
+            if (underlying != address(0)) console2.log("Initial underlying:", underlying);
         }
     }
 }
