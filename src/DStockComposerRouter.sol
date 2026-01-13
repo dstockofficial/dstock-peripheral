@@ -9,9 +9,15 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @dev Minimal LayerZero OFT compose message decoder.
-/// Compose payload format:
-/// nonce(8) | srcEid(4) | amountLD(32) | composeFrom(32) | composeMsg(bytes)
+/// @dev Minimal LayerZero OFT compose message decoder used by `lzCompose`.
+///
+/// LayerZero compose payload format (EVM OFT):
+/// `nonce(8) | srcEid(4) | amountLD(32) | composeFrom(32) | composeMsg(bytes)`
+///
+/// Notes:
+/// - `amountLD` is the amount *credited* to this contract on the token/OFT side before `lzCompose` is executed.
+/// - `composeMsg` is arbitrary bytes provided by the sender; in this router it is expected to be `abi.encode(RouteMsg)`
+///   for forward or `abi.encode(ReverseRouteMsg)` for reverse.
 library OFTComposeMsgCodecLite {
     uint256 private constant AMOUNT_LD_START = 12; // 8 + 4
     uint256 private constant AMOUNT_LD_END = 44; // 12 + 32
@@ -28,9 +34,10 @@ library OFTComposeMsgCodecLite {
     }
 }
 
-/**
- * @dev Minimal interface for an OFT (EVM) token used for routing.
- */
+/// @dev Minimal interface for an EVM OFT token / adapter.
+/// In this repo we use the same interface for:
+/// - `shareAdapter` (bridging wrapper shares to destination)
+/// - `underlying` (reverse hop: bridging underlying token to destination)
 interface IOFTLike {
     struct SendParam {
         uint32 dstEid;
@@ -65,22 +72,21 @@ interface IOFTLike {
         );
 }
 
-/**
- * @dev DStockWrapper interface we rely on.
- */
+/// @dev Minimal wrapper interface used by this router.
+/// - `wrap(token, amount, to)`: consumes `token` and mints wrapper shares (18 decimals)
+/// - `unwrap(token, amount18, to)`: burns shares and returns `token` to `to`
 interface IDStockWrapperLike {
     function wrap(address token, uint256 amount, address to) external returns (uint256 net18, uint256 mintedShares);
     function unwrap(address token, uint256 amount, address to) external;
 }
 
-/// @dev Optional wrapper view interface (used for fee quoting on user wraps).
+/// @dev Optional wrapper view interface used for quoting user wraps.
+/// If a wrapper does not implement this, `quoteWrapAndBridge` will revert.
 interface IDStockWrapperPreview {
     function previewWrap(address token, uint256 amount) external view returns (uint256 net18, uint256 fee);
 }
 
-/**
- * @dev LayerZero v2 compose interface (executor calls this via EndpointV2).
- */
+/// @dev LayerZero v2 compose interface (EndpointV2 calls this on the compose target).
 interface IOAppComposer {
     function lzCompose(
         address _oApp,
@@ -91,18 +97,29 @@ interface IOAppComposer {
     ) external payable;
 }
 
-/**
- * @title DStockComposerRouter
- * @notice UUPS-upgradeable, multi-asset LayerZero compose-driven two-hop router on BSC.
- *
- * - Forward: receives `underlying` (credited on lzReceive) -> wraps into `wrapper` shares -> sends shares via `shareAdapter`.
- * - Reverse: receives wrapper shares via `shareAdapter` -> unwraps into `underlying` -> sends underlying to the final chain.
- *
- * Key safety properties:
- * - GUID idempotency (processedGuids)
- * - Pause does not revert compose (refund + return)
- * - Failures do not revert compose (refund + return); funds can be rescued if refund fails
- */
+/// @title DStockComposerRouter
+/// @notice Unified router for the DStock ecosystem (UUPS upgradeable).
+///
+/// This contract combines:
+/// - **User entry (BSC)**: `wrapAndBridge` / `quoteWrapAndBridge`
+/// - **LayerZero compose callback**: `lzCompose` (forward + reverse)
+///
+/// ### High-level flows
+/// - **Forward (compose)**: an `underlying` token is credited to this router -> wrap into `wrapper` shares -> bridge shares via `shareAdapter`.
+/// - **Reverse (compose)**: `wrapper` shares are credited to this router via `shareAdapter` -> unwrap into `underlying` -> either:
+///   - deliver locally if `finalDstEid == chainEid`, or
+///   - bridge underlying via the `underlying` OFT token.
+///
+/// ### Registries (owner configured)
+/// - `underlyingToWrapper[underlying] = wrapper`
+/// - `underlyingToShareAdapter[underlying] = shareAdapter`
+/// - `shareAdapterToWrapper[shareAdapter] = wrapper` (used to identify reverse compose)
+///
+/// ### Safety / behavior notes
+/// - **Idempotency**: `processedGuids[guid]` ensures a compose GUID is processed at most once.
+/// - **Compose failure handling**: most compose-path failures do **not** revert; the router emits `RouteFailed` and
+///   attempts to refund tokens / native fee to `refundBsc` (best effort).
+/// - **Hard reverts**: `lzCompose` still reverts for `NotEndpoint` and for unknown `_oApp` (`InvalidOApp`).
 contract DStockComposerRouter is
     Initializable,
     UUPSUpgradeable,
@@ -113,31 +130,39 @@ contract DStockComposerRouter is
     using OFTComposeMsgCodecLite for bytes;
     using SafeERC20 for IERC20;
 
-    /// @notice BSC EndpointV2 address
+    /// @notice LayerZero EndpointV2 address on this chain.
     address public endpoint;
 
-    /// @notice The LayerZero endpoint ID (eid) of the chain this router is deployed on.
+    /// @notice The LayerZero EID of the chain this router is deployed on.
+    /// Used only for reverse-route local delivery checks.
     uint32 public chainEid;
 
-    /// @notice underlying token (either OFT or local ERC20) -> wrapper (shares token + wrap/unwrap interface).
+    /// @notice Underlying token (either OFT or local ERC20) -> wrapper (shares token + wrap/unwrap interface).
     mapping(address => address) public underlyingToWrapper;
 
-    /// @notice underlying token (either OFT or local ERC20) -> shareAdapter (OFT adapter for shares to HyperEVM).
+    /// @notice Underlying token (either OFT or local ERC20) -> shareAdapter (OFT adapter for shares to destination).
     mapping(address => address) public underlyingToShareAdapter;
 
-    /// @notice shareAdapter -> wrapper.
+    /// @notice shareAdapter -> wrapper (reverse-route identification and unwrap routing).
     mapping(address => address) public shareAdapterToWrapper;
 
+    /// @notice Compose GUIDs already processed (idempotency).
     mapping(bytes32 => bool) public processedGuids;
 
     uint256[50] private __gap;
 
+    /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
+    /// @notice Emitted when a shareAdapter reverse route is configured.
     event ShareAdapterWrapperSet(address indexed shareAdapter, address indexed wrapper);
 
+    /// @notice Forward compose success: underlying was wrapped and shares were bridged to `finalDstEid/finalTo`.
     event WrappedAndForwarded(bytes32 indexed guid, uint32 finalDstEid, bytes32 finalTo, uint256 underlyingIn, uint256 sharesOut);
+    /// @notice Reverse compose success: shares were unwrapped and underlying was delivered/bridged to `finalDstEid/finalTo`.
     event UnwrappedAndForwarded(bytes32 indexed guid, uint32 finalDstEid, bytes32 finalTo, uint256 sharesIn, uint256 underlyingOut);
+    /// @notice Any route failure (compose paths). `amountLD` is the token amount attempted/refunded (best effort).
     event RouteFailed(bytes32 indexed guid, string reason, address refundBsc, uint256 amountLD);
+    /// @notice Token refund failed (token might require a different transfer method); owner can rescue later.
     event RefundFailed(bytes32 indexed guid, address indexed token, address indexed refundBsc, uint256 amount);
 
     error ZeroAddress();
@@ -149,24 +174,42 @@ contract DStockComposerRouter is
     error InsufficientFee(uint256 provided, uint256 required);
     error RefundFailedNative();
 
+    /// @notice Forward-route payload encoded inside LayerZero `composeMsg` (`abi.encode(RouteMsg)`).
     struct RouteMsg {
+        /// @notice Final destination EID for shares (second hop).
         uint32 finalDstEid;
+        /// @notice Final recipient on destination chain (bytes32-encoded).
         bytes32 finalTo;
+        /// @notice EVM address on this chain used for refunding tokens/native fees if something fails.
         address refundBsc;
+        /// @notice Minimum shares for the second hop (0 = accept quoted amount).
         uint256 minAmountLD2;
     }
 
+    /// @notice Reverse-route payload encoded inside LayerZero `composeMsg` (`abi.encode(ReverseRouteMsg)`).
     struct ReverseRouteMsg {
+        /// @notice Underlying token address (OFT token/adapter on EVM side) to receive after unwrapping.
         address underlying;
+        /// @notice Final destination EID for underlying (second hop). If equals `chainEid`, deliver locally on this chain.
         uint32 finalDstEid;
+        /// @notice Final recipient (bytes32-encoded). If delivering locally, this must encode an EVM address.
         bytes32 finalTo;
+        /// @notice EVM address on this chain used for refunding tokens/native fees if something fails.
         address refundBsc;
+        /// @notice Portion of shares to unwrap, in basis points (1..10000).
         uint16 unwrapBps;
+        /// @notice Minimum underlying for the second hop (0 = accept unwrapped amount).
         uint256 minAmountLD2;
+        /// @notice LayerZero options for the second hop (underlying.send).
         bytes extraOptions2;
+        /// @notice Optional compose payload for the second hop (underlying.send).
         bytes composeMsg2;
     }
 
+    /// @notice UUPS initializer (called once via proxy).
+    /// @param _endpoint LayerZero EndpointV2 address on this chain
+    /// @param _chainEid LayerZero EID for this chain
+    /// @param _owner Owner/admin that can configure routes and upgrade
     function initialize(address _endpoint, uint32 _chainEid, address _owner) external initializer {
         if (_endpoint == address(0) || _owner == address(0)) revert ZeroAddress();
         __Ownable_init(_owner);
@@ -180,9 +223,11 @@ contract DStockComposerRouter is
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
 
-    /// @notice Configure routing mappings in one call.
-    /// @dev Always registers the reverse mapping `shareAdapter -> wrapper`.
+    /// @notice Configure routing for one wrapper/shareAdapter pair (and optionally one underlying).
+    /// @dev Always registers the reverse mapping `shareAdapter -> wrapper` (needed for reverse compose).
     /// If `underlying != address(0)`, also registers forward mappings `underlying -> (wrapper, shareAdapter)`.
+    ///
+    /// This function can be called multiple times to register multiple underlyings that share the same wrapper/shareAdapter.
     function setRouteConfig(address underlying, address wrapper, address shareAdapter) public onlyOwner {
         if (wrapper == address(0) || shareAdapter == address(0)) revert ZeroAddress();
 
@@ -196,8 +241,12 @@ contract DStockComposerRouter is
         }
     }
 
-    /// @notice User entry: wrap an underlying token into wrapper shares and bridge shares via shareAdapter.
-    /// @dev Uses the same registry as compose-forward; `underlying` can be an OFT token or a local ERC20.
+    /// @notice User entry: wrap an underlying token into wrapper shares, then bridge shares via `shareAdapter`.
+    /// @param underlying Underlying token on this chain (local ERC20 or OFT token)
+    /// @param amount Amount of underlying in its own decimals
+    /// @param dstEid Destination EID for shares
+    /// @param to Recipient on destination chain (bytes32-encoded)
+    /// @param extraOptions LayerZero options for `shareAdapter.send`
     function wrapAndBridge(
         address underlying,
         uint256 amount,
@@ -243,8 +292,9 @@ contract DStockComposerRouter is
         }
     }
 
-    /// @notice Quote the LayerZero fee for user wrap + bridge.
+    /// @notice Quote the LayerZero fee (native) for user wrap + bridge.
     /// @dev Requires wrapper to implement `previewWrap`.
+    /// @return nativeFee The required native fee for `shareAdapter.send` (wrap cost excluded)
     function quoteWrapAndBridge(
         address underlying,
         uint256 amount,
@@ -276,6 +326,14 @@ contract DStockComposerRouter is
         return fee.nativeFee;
     }
 
+    /// @notice LayerZero compose callback entrypoint.
+    ///
+    /// Important parameters (LayerZero terminology):
+    /// - `_oApp`: the OApp address associated with the compose call.
+    ///   - Forward: `_oApp == underlying` (the token credited to this router)
+    ///   - Reverse: `_oApp == shareAdapter` (shares adapter credited shares to this router)
+    /// - `_guid`: globally unique message id used for idempotency (`processedGuids`)
+    /// - `_message`: OFT compose payload, decoded via `OFTComposeMsgCodecLite` to extract `amountLD` and `composeMsg`.
     function lzCompose(
         address _oApp,
         bytes32 _guid,
@@ -284,15 +342,21 @@ contract DStockComposerRouter is
         bytes calldata /*_extraData*/
     ) external payable nonReentrant {
         if (msg.sender != endpoint) revert NotEndpoint();
+
+        // Idempotency: LayerZero may retry compose; we must not double-process the same GUID.
         if (processedGuids[_guid]) return;
         processedGuids[_guid] = true;
 
+        // Decode the OFT compose container:
+        // - `amountLD`: amount credited to this router before compose executes
+        // - `inner`: our router payload (abi-encoded RouteMsg/ReverseRouteMsg)
         bytes memory inner = _message.composeMsg();
         uint256 amountLD = _message.amountLD();
 
         // Reverse: _oApp is a supported shareAdapter
         address wrapper = shareAdapterToWrapper[_oApp];
         if (wrapper != address(0)) {
+            // Reverse path consumes shares (`amountLD`) and produces underlying.
             _lzComposeReverse(wrapper, _guid, amountLD, inner);
             return;
         }
@@ -302,9 +366,11 @@ contract DStockComposerRouter is
         wrapper = underlyingToWrapper[_oApp];
         if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
 
+        // Forward path consumes underlying (`amountLD`) and produces shares bridged via `shareAdapter`.
         _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
     }
 
+    /// @dev Forward compose path: decode `RouteMsg`, wrap underlying into shares, then send shares.
     function _lzComposeForward(
         address underlying,
         address wrapper,
@@ -317,23 +383,29 @@ contract DStockComposerRouter is
         try this._decodeRouteMsg(inner) returns (RouteMsg memory rr) {
             r = rr;
         } catch {
+            // Bad payload: nothing to do; emit a failure and stop.
             _fail(guid, "decode_route_failed", address(0), underlyingAmount);
             return;
         }
         if (r.refundBsc == address(0)) {
+            // Refund address is mandatory because we avoid reverting compose on failures.
             _fail(guid, "refund_zero", address(0), underlyingAmount);
             return;
         }
 
+        // 1) Wrap underlying into 18-decimal shares (kept on this router initially).
         uint256 sharesOut = _wrapUnderlying(wrapper, underlying, guid, underlyingAmount, r.refundBsc);
         if (sharesOut == 0) return;
 
+        // 2) Bridge shares via shareAdapter (second hop).
         bool ok = _sendShares(wrapper, shareAdapter, guid, underlyingAmount, sharesOut, r.finalDstEid, r.finalTo, r.refundBsc, r.minAmountLD2);
         if (!ok) return;
 
+        // 3) Any leftover native (from msg.value forwarded by endpoint) is best-effort refunded.
         _refundNative(r.refundBsc);
     }
 
+    /// @dev Reverse compose path: decode `ReverseRouteMsg`, unwrap shares into underlying, then deliver locally or send underlying.
     function _lzComposeReverse(address wrapper, bytes32 guid, uint256 sharesIn, bytes memory inner) internal {
         ReverseRouteMsg memory r;
         try this._decodeReverseRouteMsg(inner) returns (ReverseRouteMsg memory rr) {
@@ -347,18 +419,22 @@ contract DStockComposerRouter is
             return;
         }
         if (r.underlying == address(0)) {
+            // We can't unwrap into a zero address token; refund shares.
             _refundToken(wrapper, guid, "underlying_zero", r.refundBsc, sharesIn);
             return;
         }
         if (r.unwrapBps == 0 || r.unwrapBps > 10_000) {
+            // Unwrap fraction is expressed in bps (1..10000).
             _refundToken(wrapper, guid, "bad_unwrap_bps", r.refundBsc, sharesIn);
             return;
         }
 
+        // 1) Unwrap shares into underlying.
         uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc, r.unwrapBps);
         if (underlyingOut == 0) return;
 
         if (r.finalDstEid == chainEid) {
+            // Local delivery (reverse only): finalTo must encode an EVM address on this chain.
             address receiver = address(uint160(uint256(r.finalTo)));
             if (receiver == address(0)) {
                 _refundToken(r.underlying, guid, "receiver_zero", r.refundBsc, underlyingOut);
@@ -369,6 +445,7 @@ contract DStockComposerRouter is
                 _refundToken(r.underlying, guid, "underlying_below_min", r.refundBsc, underlyingOut);
                 return;
             }
+            // Best-effort token transfer; if it fails, refund to refundBsc.
             bool okDeliver = _tryTransfer(r.underlying, receiver, underlyingOut);
             if (!okDeliver) {
                 _refundToken(r.underlying, guid, "deliver_failed", r.refundBsc, underlyingOut);
@@ -376,6 +453,7 @@ contract DStockComposerRouter is
             }
             emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
         } else {
+            // Cross-chain delivery: send underlying via its OFT interface (second hop).
             bool ok2 = _sendUnderlyingToFinal(r.underlying, guid, sharesIn, underlyingOut, r);
             if (!ok2) return;
         }
@@ -383,18 +461,22 @@ contract DStockComposerRouter is
         _refundNative(r.refundBsc);
     }
 
+    /// @dev Wrap underlying into wrapper shares. On failure, attempts to refund `underlyingAmount` to `refundBsc`.
     function _wrapUnderlying(address wrapper, address underlying, bytes32 guid, uint256 underlyingAmount, address refundBsc)
         internal
         returns (uint256)
     {
+        // Compose assumption: `underlyingAmount` tokens should already be on this router.
         uint256 balUnderlying = IERC20(underlying).balanceOf(address(this));
         if (balUnderlying < underlyingAmount) {
             _refundToken(underlying, guid, "insufficient_underlying", refundBsc, underlyingAmount);
             return 0;
         }
 
+        // Approve wrapper to pull the underlying for wrapping.
         IERC20(underlying).forceApprove(wrapper, underlyingAmount);
 
+        // Measure shares minted to this router (supports wrappers that don't return exact values).
         uint256 shareBalBefore = IERC20(wrapper).balanceOf(address(this));
         IDStockWrapperLike(wrapper).wrap(underlying, underlyingAmount, address(this));
         uint256 shareBalAfter = IERC20(wrapper).balanceOf(address(this));
@@ -407,6 +489,8 @@ contract DStockComposerRouter is
         return sharesOut;
     }
 
+    /// @dev Second hop for forward path: send wrapper shares via `shareAdapter`.
+    /// Uses `refundBsc` as the refund address for LayerZero native fee.
     function _sendShares(
         address wrapper,
         address shareAdapter,
@@ -420,6 +504,7 @@ contract DStockComposerRouter is
     ) internal returns (bool) {
         uint256 minShares = minAmountLD2 == 0 ? sharesOut : minAmountLD2;
 
+        // Second hop: bridge wrapper shares via shareAdapter (OFT adapter).
         IOFTLike.SendParam memory sp = IOFTLike.SendParam({
             dstEid: finalDstEid,
             to: finalTo,
@@ -447,30 +532,37 @@ contract DStockComposerRouter is
         }
     }
 
+    /// @dev Externalized decode to allow try/catch around abi.decode.
     function _decodeRouteMsg(bytes memory inner) external pure returns (RouteMsg memory) {
         return abi.decode(inner, (RouteMsg));
     }
 
+    /// @dev Externalized decode to allow try/catch around abi.decode.
     function _decodeReverseRouteMsg(bytes memory inner) external pure returns (ReverseRouteMsg memory) {
         return abi.decode(inner, (ReverseRouteMsg));
     }
 
+    /// @dev Unwrap `sharesIn * unwrapBps/10000` shares into underlying.
+    /// On unwrap failure, refunds the full `sharesIn` (shares token) to `refundBsc`.
     function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
         internal
         returns (uint256)
     {
+        // Compose assumption: `sharesIn` shares should already be on this router.
         uint256 balShares = IERC20(wrapper).balanceOf(address(this));
         if (balShares < sharesIn) {
             _refundToken(wrapper, guid, "insufficient_shares", refundBsc, sharesIn);
             return 0;
         }
 
+        // We may choose to unwrap only a fraction of shares (basis points).
         uint256 attemptUnderlying = (sharesIn * uint256(unwrapBps)) / 10_000;
         if (attemptUnderlying == 0) {
             _refundToken(wrapper, guid, "unwrap_zero_amount", refundBsc, sharesIn);
             return 0;
         }
 
+        // Track underlying delta to compute actual output.
         uint256 underlyingBalBefore = IERC20(underlying).balanceOf(address(this));
 
         try IDStockWrapperLike(wrapper).unwrap(underlying, attemptUnderlying, address(this)) {} catch {
@@ -487,10 +579,13 @@ contract DStockComposerRouter is
         return underlyingOut;
     }
 
+    /// @dev Second hop for reverse path: send `underlyingOut` via the `underlying` OFT token.
+    /// Uses `r.refundBsc` as the refund address for LayerZero native fee.
     function _sendUnderlyingToFinal(address underlying, bytes32 guid, uint256 sharesIn, uint256 underlyingOut, ReverseRouteMsg memory r)
         internal
         returns (bool)
     {
+        // Second hop: bridge underlying via its OFT interface.
         uint256 minUnderlying = r.minAmountLD2 == 0 ? underlyingOut : r.minAmountLD2;
         if (underlyingOut < minUnderlying) {
             _refundToken(underlying, guid, "underlying_below_min", r.refundBsc, underlyingOut);
@@ -521,15 +616,23 @@ contract DStockComposerRouter is
             return false;
         }
     }
+    /// @notice Rescue ERC20 tokens from this contract (admin only).
+    /// @dev Intended for edge cases where a refund failed and funds are stuck.
     function rescueToken(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(to, amount);
     }
 
+    /// @notice Rescue native gas token from this contract (admin only).
     function rescueNative(address to, uint256 amount) external onlyOwner {
         (bool ok, ) = to.call{value: amount}("");
         require(ok, "native_rescue_failed");
     }
 
+    /// @dev Best-effort refund path for compose failures:
+    /// - try refunding `amount` of `token` to `refundBsc`
+    /// - emit `RefundFailed` if token transfer fails
+    /// - emit `RouteFailed` always
+    /// - attempt refunding any native balance to `refundBsc`
     function _refundToken(address token, bytes32 guid, string memory reason, address refundBsc, uint256 amount) internal {
         if (refundBsc == address(0)) revert InvalidRefundAddress();
 
@@ -543,6 +646,8 @@ contract DStockComposerRouter is
         _refundNative(refundBsc);
     }
 
+    /// @dev Best-effort native refund: sends the contract's entire native balance to `to`.
+    /// This is intentionally non-reverting (failure is ignored).
     function _refundNative(address to) internal {
         if (to == address(0)) return;
         uint256 bal = address(this).balance;
@@ -551,11 +656,14 @@ contract DStockComposerRouter is
         ok;
     }
 
+    /// @dev Emit failure and optionally refund native balance (no token refunds).
     function _fail(bytes32 guid, string memory reason, address refundBsc, uint256 amountLD) internal {
         emit RouteFailed(guid, reason, refundBsc, amountLD);
         if (refundBsc != address(0)) _refundNative(refundBsc);
     }
 
+    /// @dev Low-level ERC20 transfer attempt that supports non-standard ERC20s.
+    /// Returns `false` if the call reverts or returns `false`.
     function _tryTransfer(address token, address to, uint256 amount) internal returns (bool) {
         (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
         if (!success) return false;
