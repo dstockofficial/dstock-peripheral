@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import "forge-std/Script.sol";
+import "forge-std/console2.sol";
+
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
+import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
+
+/// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouter and optionally registers routes.
+///
+/// Env vars:
+/// - Required:
+///   - ADMIN_PK
+///   - ENDPOINT_ADDRESS
+///   - CHAIN_EID
+///   - OWNER_ADDRESS
+/// - Optional (initial route config):
+///   - WRAPPER_ADDRESS
+///   - SHARE_ADAPTER_ADDRESS
+///   - UNDERLYING_ADDRESS (single underlying token)
+///   - UNDERLYING_ADDRESSES (comma-separated list, overrides UNDERLYING_ADDRESS)
+contract DeployComposerRouterProxy is Script {
+    function run() external {
+        uint256 adminPk = vm.envUint("ADMIN_PK");
+
+        address endpoint = vm.envAddress("ENDPOINT_ADDRESS");
+        uint32 chainEid = uint32(vm.envUint("CHAIN_EID"));
+        address owner = vm.envAddress("OWNER_ADDRESS");
+
+        // optional: initial route registration
+        address wrapper = vm.envOr("WRAPPER_ADDRESS", address(0));
+        address shareAdapter = vm.envOr("SHARE_ADAPTER_ADDRESS", address(0));
+        address underlying = vm.envOr("UNDERLYING_ADDRESS", address(0));
+        string memory underlyingsCsv = vm.envOr("UNDERLYING_ADDRESSES", string(""));
+
+        vm.startBroadcast(adminPk);
+
+        // 1) deploy implementation
+        DStockComposerRouter impl = new DStockComposerRouter();
+
+        // 2) deploy proxy + initialize
+        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (endpoint, chainEid, owner));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+
+        // 3) optional: register routes
+        if (wrapper != address(0) && shareAdapter != address(0)) {
+            DStockComposerRouter router = DStockComposerRouter(payable(address(proxy)));
+
+            // Always register reverse mapping (shareAdapter -> wrapper).
+            // If no underlying is provided, this still enables reverse compose routing.
+            router.setRouteConfig(address(0), wrapper, shareAdapter);
+
+            // Register one or more underlyings for forward routing.
+            // - If UNDERLYING_ADDRESSES is set (non-empty), it overrides UNDERLYING_ADDRESS.
+            // - Format: "0xabc...,0xdef...,0x123..."
+            if (bytes(underlyingsCsv).length > 0) {
+                address[] memory list = _parseAddressCsv(underlyingsCsv);
+                for (uint256 i = 0; i < list.length; i++) {
+                    if (list[i] == address(0)) continue;
+                    router.setRouteConfig(list[i], wrapper, shareAdapter);
+                }
+            } else if (underlying != address(0)) {
+                router.setRouteConfig(underlying, wrapper, shareAdapter);
+            }
+        }
+
+        vm.stopBroadcast();
+
+        console2.log("DStockComposerRouter implementation:", address(impl));
+        console2.log("DStockComposerRouter proxy:", address(proxy));
+        console2.log("Endpoint:", endpoint);
+        console2.log("ChainEid:", chainEid);
+        console2.log("Owner:", owner);
+        if (wrapper != address(0) && shareAdapter != address(0)) {
+            console2.log("Initial wrapper:", wrapper);
+            console2.log("Initial shareAdapter:", shareAdapter);
+            if (bytes(underlyingsCsv).length > 0) {
+                console2.log("Initial underlyings (csv):", underlyingsCsv);
+            } else if (underlying != address(0)) {
+                console2.log("Initial underlying:", underlying);
+            }
+        }
+    }
+
+    function _parseAddressCsv(string memory csv) internal view returns (address[] memory) {
+        bytes memory b = bytes(csv);
+
+        // Count commas to size the array.
+        uint256 count = 1;
+        for (uint256 i = 0; i < b.length; i++) {
+            if (b[i] == bytes1(",")) count++;
+        }
+        address[] memory out = new address[](count);
+
+        uint256 start = 0;
+        uint256 idx = 0;
+        for (uint256 i = 0; i <= b.length; i++) {
+            if (i == b.length || b[i] == bytes1(",")) {
+                string memory part = _trim(_slice(csv, start, i));
+                if (bytes(part).length > 0) {
+                    out[idx] = vm.parseAddress(part);
+                }
+                idx++;
+                start = i + 1;
+            }
+        }
+        return out;
+    }
+
+    function _slice(string memory s, uint256 start, uint256 end) internal pure returns (string memory) {
+        bytes memory b = bytes(s);
+        if (end <= start) return "";
+        bytes memory out = new bytes(end - start);
+        for (uint256 i = start; i < end; i++) {
+            out[i - start] = b[i];
+        }
+        return string(out);
+    }
+
+    function _trim(string memory s) internal pure returns (string memory) {
+        bytes memory b = bytes(s);
+        uint256 start = 0;
+        uint256 end = b.length;
+        while (start < end && (b[start] == 0x20 || b[start] == 0x09 || b[start] == 0x0A || b[start] == 0x0D)) start++;
+        while (end > start && (b[end - 1] == 0x20 || b[end - 1] == 0x09 || b[end - 1] == 0x0A || b[end - 1] == 0x0D)) end--;
+        return _slice(s, start, end);
+    }
+}
+
