@@ -8,8 +8,12 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
 import {MockOFTLikeToken} from "./mocks/MockOFTLikeToken.sol";
 import {MockOFTLikeAdapter} from "./mocks/MockOFTLikeAdapter.sol";
+import {MockOFTLikeAdapterRevertSend} from "./mocks/MockOFTLikeAdapterRevertSend.sol";
+import {MockOFTLikeTokenRevertSend} from "./mocks/MockOFTLikeTokenRevertSend.sol";
 import {MockComposerWrapper} from "./mocks/MockComposerWrapper.sol";
+import {MockComposerWrapperNoOpUnwrap} from "./mocks/MockComposerWrapperNoOpUnwrap.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockERC20Blocklist} from "./mocks/MockERC20Blocklist.sol";
 
 contract DStockComposerRouterTest is Test {
     address internal constant ENDPOINT = address(0xE11D);
@@ -25,6 +29,7 @@ contract DStockComposerRouterTest is Test {
     MockERC20 internal localUnderlying;
 
     event RouteFailed(bytes32 indexed guid, string reason, address refundBsc, uint256 amountLD);
+    event RefundFailed(bytes32 indexed guid, address indexed token, address indexed refundBsc, uint256 amount);
 
     function setUp() public {
         // deploy implementation + proxy and initialize
@@ -70,6 +75,29 @@ contract DStockComposerRouterTest is Test {
         assertEq(router.underlyingToWrapper(address(underlyingOft)), address(wrapper));
         assertEq(router.underlyingToShareAdapter(address(underlyingOft)), address(shareAdapter));
         assertEq(router.shareAdapterToWrapper(address(shareAdapter)), address(wrapper));
+    }
+
+    function test_setRouteConfig_onlyOwner() public {
+        vm.prank(address(0xA11CE));
+        vm.expectRevert();
+        router.setRouteConfig(address(0x1234), address(wrapper), address(shareAdapter));
+    }
+
+    function test_setRouteConfig_revertIfZeroWrapperOrAdapter() public {
+        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        router.setRouteConfig(address(underlyingOft), address(0), address(shareAdapter));
+
+        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        router.setRouteConfig(address(underlyingOft), address(wrapper), address(0));
+    }
+
+    function test_setRouteConfig_underlyingZero_onlySetsReverseMapping() public {
+        MockOFTLikeAdapter a = new MockOFTLikeAdapter(address(wrapper));
+        router.setRouteConfig(address(0), address(wrapper), address(a));
+
+        assertEq(router.shareAdapterToWrapper(address(a)), address(wrapper));
+        assertEq(router.underlyingToWrapper(address(0)), address(0));
+        assertEq(router.underlyingToShareAdapter(address(0)), address(0));
     }
 
     function test_wrapAndBridge_user_success() public {
@@ -167,6 +195,15 @@ contract DStockComposerRouterTest is Test {
         router.quoteWrapAndBridge(address(localUnderlying), 1, 30367, bytes32(0), "");
     }
 
+    function test_quoteWrapAndBridge_revertIfPreviewWrapReturnsZero() public {
+        // wrapper.previewWrap returns 0 if decimals not configured
+        MockERC20 u = new MockERC20("U", "U", 6);
+        router.setRouteConfig(address(u), address(wrapper), address(shareAdapter));
+
+        vm.expectRevert(DStockComposerRouter.AmountZero.selector);
+        router.quoteWrapAndBridge(address(u), 1e6, 30367, bytes32(uint256(1)), "");
+    }
+
     function test_lzCompose_revertIfNotEndpoint() public {
         vm.expectRevert(DStockComposerRouter.NotEndpoint.selector);
         router.lzCompose(address(underlyingOft), bytes32("guidNE"), "", address(0), "");
@@ -180,6 +217,99 @@ contract DStockComposerRouterTest is Test {
         vm.prank(ENDPOINT);
         vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
         router.lzCompose(address(0xBADD), bytes32("guidBad"), message, address(0), "");
+    }
+
+    function test_lzCompose_forward_decodeRouteFailed_emitsRouteFailed() public {
+        uint256 amountUnderlying = 100e6;
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        (, bytes memory message) = _compose(bytes32("guidDecodeFwd"), amountUnderlying, hex"deadbeef");
+
+        vm.expectEmit(true, true, true, true);
+        emit RouteFailed(bytes32("guidDecodeFwd"), "decode_route_failed", address(0), amountUnderlying);
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(underlyingOft), bytes32("guidDecodeFwd"), message, address(0), "");
+    }
+
+    function test_lzCompose_forward_refundZero_emitsRouteFailed_andKeepsUnderlying() public {
+        uint256 amountUnderlying = 100e6;
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: address(0), minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidRefund0Fwd"), amountUnderlying, abi.encode(r));
+
+        vm.expectEmit(true, true, true, true);
+        emit RouteFailed(bytes32("guidRefund0Fwd"), "refund_zero", address(0), amountUnderlying);
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(underlyingOft), bytes32("guidRefund0Fwd"), message, address(0), "");
+
+        // no wrapping attempted
+        assertEq(underlyingOft.balanceOf(address(router)), amountUnderlying);
+    }
+
+    function test_lzCompose_forward_feeInsufficient_refundsSharesToRefundBsc() public {
+        uint256 amountUnderlying = 10e6;
+        uint256 expectedShares = amountUnderlying * 1e12;
+
+        underlyingOft.mint(address(router), amountUnderlying);
+        shareAdapter.setFee(1 ether); // router has 0 ether => fee insufficient
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidFeeFwd"), amountUnderlying, abi.encode(r));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(underlyingOft), bytes32("guidFeeFwd"), message, address(0), "");
+
+        // shares refunded to refundBsc
+        assertEq(wrapper.balanceOf(REFUND), expectedShares);
+        assertEq(wrapper.balanceOf(address(router)), 0);
+    }
+
+    function test_lzCompose_forward_sendReverts_refundsSharesToRefundBsc() public {
+        uint256 amountUnderlying = 10e6;
+        uint256 expectedShares = amountUnderlying * 1e12;
+
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        // Configure a shareAdapter that reverts on send
+        MockOFTLikeAdapterRevertSend badAdapter = new MockOFTLikeAdapterRevertSend(address(wrapper));
+        badAdapter.setFee(0);
+        badAdapter.setRevertOnSend(true);
+        router.setRouteConfig(address(underlyingOft), address(wrapper), address(badAdapter));
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidSendFailFwd"), amountUnderlying, abi.encode(r));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(underlyingOft), bytes32("guidSendFailFwd"), message, address(0), "");
+
+        assertEq(wrapper.balanceOf(REFUND), expectedShares);
+        assertEq(wrapper.balanceOf(address(router)), 0);
+    }
+
+    function test_lzCompose_forward_refundsLeftoverNativeToRefundBsc() public {
+        uint256 amountUnderlying = 10e6;
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        shareAdapter.setFee(0.1 ether);
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidRefundNativeFwd"), amountUnderlying, abi.encode(r));
+
+        vm.deal(ENDPOINT, 1 ether);
+        uint256 preRefund = REFUND.balance;
+
+        vm.prank(ENDPOINT);
+        router.lzCompose{value: 0.5 ether}(address(underlyingOft), bytes32("guidRefundNativeFwd"), message, address(0), "");
+
+        // 0.1 is spent on send; 0.4 is refunded (best-effort)
+        assertEq(REFUND.balance, preRefund + 0.4 ether);
     }
 
     function test_lzCompose_forward_success() public {
@@ -268,6 +398,159 @@ contract DStockComposerRouterTest is Test {
         assertEq(underlyingOft.balanceOf(address(router)), 0);
     }
 
+    function test_lzCompose_reverse_decodeReverseFailed_emitsRouteFailed() public {
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        (, bytes memory message) = _compose(bytes32("guidDecodeRev"), sharesIn, hex"deadbeef");
+
+        vm.expectEmit(true, true, true, true);
+        emit RouteFailed(bytes32("guidDecodeRev"), "decode_reverse_route_failed", address(0), sharesIn);
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidDecodeRev"), message, address(0), "");
+    }
+
+    function test_lzCompose_reverse_refundZero_emitsRouteFailed() public {
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: address(0),
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidRefund0Rev"), sharesIn, abi.encode(rr));
+
+        vm.expectEmit(true, true, true, true);
+        emit RouteFailed(bytes32("guidRefund0Rev"), "refund_zero", address(0), sharesIn);
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidRefund0Rev"), message, address(0), "");
+    }
+
+    function test_lzCompose_reverse_underlyingZero_refundsShares() public {
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(0),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidUnder0"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidUnder0"), message, address(0), "");
+
+        assertEq(wrapper.balanceOf(REFUND), sharesIn);
+    }
+
+    function test_lzCompose_reverse_badUnwrapBps_refundsShares() public {
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 0,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidBps0"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidBps0"), message, address(0), "");
+
+        assertEq(wrapper.balanceOf(REFUND), sharesIn);
+    }
+
+    function test_lzCompose_reverse_insufficientShares_emitsRefundFailed() public {
+        uint256 sharesIn = 1000e18;
+        // router has 0 shares; refund attempt will fail and emit RefundFailed
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidNoShares"), sharesIn, abi.encode(rr));
+
+        vm.expectEmit(true, true, true, true);
+        emit RefundFailed(bytes32("guidNoShares"), address(wrapper), REFUND, sharesIn);
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidNoShares"), message, address(0), "");
+    }
+
+    function test_lzCompose_reverse_unwrapZeroAmount_refundsShares() public {
+        uint256 sharesIn = 1; // 1 wei share
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 1, // 0.01% => floor to 0
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidZeroAmt"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidZeroAmt"), message, address(0), "");
+
+        assertEq(wrapper.balanceOf(REFUND), sharesIn);
+    }
+
+    function test_lzCompose_reverse_unwrapZeroOut_refundsShares() public {
+        // Use wrapper whose unwrap is a no-op so underlyingOut == 0 and shares can still be refunded.
+        MockComposerWrapperNoOpUnwrap w = new MockComposerWrapperNoOpUnwrap();
+        MockOFTLikeAdapter a = new MockOFTLikeAdapter(address(w));
+        router.setRouteConfig(address(0), address(w), address(a)); // reverse mapping for adapter
+        w.setUnderlyingDecimals(address(underlyingOft), 6);
+
+        uint256 sharesIn = 1000e18;
+        w.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidZeroOut"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(a), bytes32("guidZeroOut"), message, address(0), "");
+
+        assertEq(w.balanceOf(REFUND), sharesIn);
+    }
+
     function test_lzCompose_reverse_deliverLocal_whenFinalDstIsChainEid() public {
         address receiver = address(0xCAFE);
 
@@ -301,6 +584,69 @@ contract DStockComposerRouterTest is Test {
         assertGt(underlyingOft.balanceOf(receiver), 0);
     }
 
+    function test_lzCompose_reverse_local_underlyingBelowMin_refundsUnderlying() public {
+        address receiver = address(0xCAFE);
+
+        underlyingOft.mint(address(wrapper), 2000e6);
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: CHAIN_EID,
+            finalTo: bytes32(uint256(uint160(receiver))),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 2000e6, // larger than unwrapped amount
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+
+        (, bytes memory message) = _compose(bytes32("guidMinLocal"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidMinLocal"), message, address(0), "");
+
+        // receiver got nothing; refund got underlying
+        assertEq(underlyingOft.balanceOf(receiver), 0);
+        assertEq(underlyingOft.balanceOf(REFUND), 1000e6);
+    }
+
+    function test_lzCompose_reverse_local_deliverFailed_refundsUnderlying() public {
+        address receiver = address(0xCAFE);
+
+        MockERC20Blocklist bad = new MockERC20Blocklist("Bad", "BAD", 6);
+        bad.setBlockedRecipient(receiver);
+        wrapper.setUnderlyingDecimals(address(bad), 6);
+
+        // provide liquidity to wrapper
+        bad.mint(address(wrapper), 2000e6);
+
+        // credit shares to router
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(bad),
+            finalDstEid: CHAIN_EID,
+            finalTo: bytes32(uint256(uint160(receiver))),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+
+        (, bytes memory message) = _compose(bytes32("guidDeliverFail"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidDeliverFail"), message, address(0), "");
+
+        // delivery to receiver failed => refunded to refundBsc
+        assertEq(bad.balanceOf(receiver), 0);
+        assertEq(bad.balanceOf(REFUND), 1000e6);
+    }
+
     function test_lzCompose_reverse_receiverZero_emitsRouteFailedAndRefundsUnderlying() public {
         // Liquidity for unwrap
         underlyingOft.mint(address(wrapper), 2000e6);
@@ -332,6 +678,86 @@ contract DStockComposerRouterTest is Test {
         assertEq(underlyingOft.balanceOf(REFUND), 1000e6);
     }
 
+    function test_lzCompose_reverse_crosschain_underlyingBelowMin_refundsUnderlying() public {
+        underlyingOft.mint(address(wrapper), 2000e6);
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 2000e6, // larger than unwrapped amount
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidMinX"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidMinX"), message, address(0), "");
+
+        assertEq(underlyingOft.balanceOf(REFUND), 1000e6);
+    }
+
+    function test_lzCompose_reverse_crosschain_feeInsufficient_refundsUnderlying() public {
+        underlyingOft.mint(address(wrapper), 2000e6);
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        underlyingOft.setFee(1 ether); // router has 0 ether => fee insufficient
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidFeeX"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidFeeX"), message, address(0), "");
+
+        assertEq(underlyingOft.balanceOf(REFUND), 1000e6);
+    }
+
+    function test_lzCompose_reverse_crosschain_sendReverts_refundsUnderlying() public {
+        MockOFTLikeTokenRevertSend u = new MockOFTLikeTokenRevertSend("Revert", "R", 6);
+        u.setFee(0);
+        u.setRevertOnSend(true);
+        wrapper.setUnderlyingDecimals(address(u), 6);
+
+        // wrapper liquidity for unwrap
+        u.mint(address(wrapper), 2000e6);
+
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        // fund router not necessary since fee=0
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(u),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidSendX"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidSendX"), message, address(0), "");
+
+        // send reverted => refunded underlying
+        assertEq(u.balanceOf(REFUND), 1000e6);
+    }
+
     function test_lzCompose_reverse_unwrapFails_refundsShares() public {
         // Use a token the wrapper doesn't support (decimals not configured), so unwrap will revert and router refunds shares.
         MockOFTLikeToken badUnderlying = new MockOFTLikeToken("Bad", "BAD", 6);
@@ -356,6 +782,81 @@ contract DStockComposerRouterTest is Test {
 
         // shares refunded to refundBsc
         assertEq(wrapper.balanceOf(REFUND), sharesIn);
+    }
+
+    function test_decodeHelpers_workAndRevert() public {
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 7});
+        DStockComposerRouter.RouteMsg memory r2 = router._decodeRouteMsg(abi.encode(r));
+        assertEq(r2.finalDstEid, r.finalDstEid);
+        assertEq(r2.finalTo, r.finalTo);
+        assertEq(r2.refundBsc, r.refundBsc);
+        assertEq(r2.minAmountLD2, r.minAmountLD2);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(underlyingOft),
+            finalDstEid: 40168,
+            finalTo: bytes32(uint256(123)),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 9,
+            extraOptions2: hex"01",
+            composeMsg2: hex"02"
+        });
+        DStockComposerRouter.ReverseRouteMsg memory rr2 = router._decodeReverseRouteMsg(abi.encode(rr));
+        assertEq(rr2.underlying, rr.underlying);
+        assertEq(rr2.finalDstEid, rr.finalDstEid);
+        assertEq(rr2.finalTo, rr.finalTo);
+        assertEq(rr2.refundBsc, rr.refundBsc);
+        assertEq(rr2.unwrapBps, rr.unwrapBps);
+        assertEq(rr2.minAmountLD2, rr.minAmountLD2);
+        assertEq(rr2.extraOptions2, rr.extraOptions2);
+        assertEq(rr2.composeMsg2, rr.composeMsg2);
+
+        vm.expectRevert();
+        router._decodeRouteMsg(hex"deadbeef");
+
+        vm.expectRevert();
+        router._decodeReverseRouteMsg(hex"deadbeef");
+    }
+
+    function test_rescueToken_onlyOwner_andTransfers() public {
+        MockERC20 t = new MockERC20("T", "T", 18);
+        t.mint(address(router), 123);
+
+        address to = address(0xCAFE);
+        router.rescueToken(address(t), to, 123);
+        assertEq(t.balanceOf(to), 123);
+
+        // non-owner
+        t.mint(address(router), 1);
+        vm.prank(address(0xA11CE));
+        vm.expectRevert();
+        router.rescueToken(address(t), to, 1);
+    }
+
+    function test_rescueNative_onlyOwner_andTransfers() public {
+        vm.deal(address(router), 1 ether);
+
+        address to = address(0xCAFE);
+        uint256 pre = to.balance;
+        router.rescueNative(to, 0.4 ether);
+        assertEq(to.balance, pre + 0.4 ether);
+
+        vm.prank(address(0xA11CE));
+        vm.expectRevert();
+        router.rescueNative(to, 0.1 ether);
+    }
+
+    function test_upgradeToAndCall_onlyOwner() public {
+        DStockComposerRouter newImpl = new DStockComposerRouter();
+
+        vm.prank(address(0xA11CE));
+        vm.expectRevert();
+        router.upgradeToAndCall(address(newImpl), "");
+
+        // owner upgrade should succeed
+        router.upgradeToAndCall(address(newImpl), "");
     }
 }
 
