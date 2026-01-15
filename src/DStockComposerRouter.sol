@@ -86,6 +86,11 @@ interface IDStockWrapperPreview {
     function previewWrap(address token, uint256 amount) external view returns (uint256 net18, uint256 fee);
 }
 
+/// @dev Minimal WETH9/WBNB interface for wrapping native gas token into ERC20.
+interface IWrappedNative {
+    function deposit() external payable;
+}
+
 /// @dev LayerZero v2 compose interface (EndpointV2 calls this on the compose target).
 interface IOAppComposer {
     function lzCompose(
@@ -149,7 +154,11 @@ contract DStockComposerRouter is
     /// @notice Compose GUIDs already processed (idempotency).
     mapping(bytes32 => bool) public processedGuids;
 
-    uint256[50] private __gap;
+    /// @notice Wrapped native token (e.g., WBNB/WETH) used by `wrapAndBridgeNative`.
+    /// @dev Owner must configure this and register a route via `setRouteConfig(wrappedNative, wrapper, shareAdapter)`.
+    address public wrappedNative;
+
+    uint256[49] private __gap;
 
     /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
@@ -173,6 +182,7 @@ contract DStockComposerRouter is
     error InvalidRecipient();
     error InsufficientFee(uint256 provided, uint256 required);
     error RefundFailedNative();
+    error WrappedNativeNotSet();
 
     /// @notice Forward-route payload encoded inside LayerZero `composeMsg` (`abi.encode(RouteMsg)`).
     struct RouteMsg {
@@ -241,6 +251,12 @@ contract DStockComposerRouter is
         }
     }
 
+    /// @notice Configure wrapped native token (e.g., WBNB/WETH) for `wrapAndBridgeNative`.
+    function setWrappedNative(address wrappedNative_) external onlyOwner {
+        if (wrappedNative_ == address(0)) revert ZeroAddress();
+        wrappedNative = wrappedNative_;
+    }
+
     /// @notice User entry: wrap an underlying token into wrapper shares, then bridge shares via `shareAdapter`.
     /// @param underlying Underlying token on this chain (local ERC20 or OFT token)
     /// @param amount Amount of underlying in its own decimals
@@ -286,6 +302,59 @@ contract DStockComposerRouter is
         IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
 
         uint256 refund = msg.value - fee.nativeFee;
+        if (refund > 0) {
+            (bool ok, ) = msg.sender.call{value: refund}("");
+            if (!ok) revert RefundFailedNative();
+        }
+    }
+
+    /// @notice User entry: wrap native gas token (BNB/ETH) into `wrappedNative` (WBNB/WETH), then wrap into shares and bridge.
+    /// @dev `msg.value` must cover `amountNative` + LayerZero native fee. Any leftover fee is refunded to `msg.sender`.
+    function wrapAndBridgeNative(
+        uint256 amountNative,
+        uint32 dstEid,
+        bytes32 to,
+        bytes calldata extraOptions
+    ) external payable nonReentrant returns (uint256 amountSentLD) {
+        if (amountNative == 0) revert AmountZero();
+        if (to == bytes32(0)) revert InvalidRecipient();
+
+        address w = wrappedNative;
+        if (w == address(0)) revert WrappedNativeNotSet();
+        if (msg.value < amountNative) revert InsufficientFee(msg.value, amountNative);
+
+        // 1) Wrap native into ERC20 on this router.
+        IWrappedNative(w).deposit{value: amountNative}();
+
+        // 2) Reuse the same wrap + bridge pipeline, using `w` as the underlying token.
+        address wrapper = underlyingToWrapper[w];
+        address shareAdapter = underlyingToShareAdapter[w];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+        IERC20(w).forceApprove(wrapper, amountNative);
+        (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(w, amountNative, address(this));
+        amountSentLD = net18;
+        if (amountSentLD == 0) revert AmountZero();
+
+        IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
+
+        IOFTLike.SendParam memory sp = IOFTLike.SendParam({
+            dstEid: dstEid,
+            to: to,
+            amountLD: amountSentLD,
+            minAmountLD: amountSentLD,
+            extraOptions: extraOptions,
+            composeMsg: "",
+            oftCmd: ""
+        });
+
+        IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
+        uint256 availableFee = msg.value - amountNative;
+        if (availableFee < fee.nativeFee) revert InsufficientFee(availableFee, fee.nativeFee);
+
+        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+
+        uint256 refund = availableFee - fee.nativeFee;
         if (refund > 0) {
             (bool ok, ) = msg.sender.call{value: refund}("");
             if (!ok) revert RefundFailedNative();
