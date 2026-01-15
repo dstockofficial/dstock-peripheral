@@ -7,6 +7,7 @@ import "forge-std/console2.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
+import {WrappedNativePayoutHelper} from "../src/WrappedNativePayoutHelper.sol";
 
 /// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouter and optionally registers routes.
 ///
@@ -21,6 +22,9 @@ import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
 ///   - SHARE_ADAPTER_ADDRESS
 ///   - UNDERLYING_ADDRESS (single underlying token)
 ///   - UNDERLYING_ADDRESSES (comma-separated list, overrides UNDERLYING_ADDRESS)
+/// - Optional (wrapped native support):
+///   - WRAPPED_NATIVE_ADDRESS (e.g., WBNB/WETH on this chain)
+///   - WRAPPED_NATIVE_PAYOUT_HELPER_ADDRESS (if unset and WRAPPED_NATIVE_ADDRESS is set, script deploys a helper)
 contract DeployComposerRouterProxy is Script {
     function run() external {
         uint256 adminPk = vm.envUint("ADMIN_PK");
@@ -34,6 +38,8 @@ contract DeployComposerRouterProxy is Script {
         address shareAdapter = vm.envOr("SHARE_ADAPTER_ADDRESS", address(0));
         address underlying = vm.envOr("UNDERLYING_ADDRESS", address(0));
         string memory underlyingsCsv = vm.envOr("UNDERLYING_ADDRESSES", string(""));
+        address wrappedNative = vm.envOr("WRAPPED_NATIVE_ADDRESS", address(0));
+        address wrappedNativeHelper = vm.envOr("WRAPPED_NATIVE_PAYOUT_HELPER_ADDRESS", address(0));
 
         vm.startBroadcast(adminPk);
 
@@ -44,7 +50,7 @@ contract DeployComposerRouterProxy is Script {
         bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (endpoint, chainEid, owner));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
 
-        // 3) optional: register routes
+        // 3) optional: configure routes / wrapped native
         if (wrapper != address(0) && shareAdapter != address(0)) {
             DStockComposerRouter router = DStockComposerRouter(payable(address(proxy)));
 
@@ -64,6 +70,23 @@ contract DeployComposerRouterProxy is Script {
             } else if (underlying != address(0)) {
                 router.setRouteConfig(underlying, wrapper, shareAdapter);
             }
+
+            // Optional: enable native entry + reverse-local native delivery via wrapped native token.
+            // - Requires WRAPPED_NATIVE_ADDRESS (WBNB/WETH on this chain)
+            // - For wrapAndBridgeNative: also registers wrappedNative as an underlying route for the same (wrapper, shareAdapter)
+            if (wrappedNative != address(0)) {
+                router.setWrappedNative(wrappedNative);
+
+                // If helper isn't provided, deploy one now.
+                if (wrappedNativeHelper == address(0)) {
+                    WrappedNativePayoutHelper helper = new WrappedNativePayoutHelper();
+                    wrappedNativeHelper = address(helper);
+                }
+                router.setWrappedNativePayoutHelper(wrappedNativeHelper);
+
+                // Needed for `wrapAndBridgeNative` (so router can map wrappedNative -> (wrapper, shareAdapter)).
+                router.setRouteConfig(wrappedNative, wrapper, shareAdapter);
+            }
         }
 
         vm.stopBroadcast();
@@ -80,6 +103,10 @@ contract DeployComposerRouterProxy is Script {
                 console2.log("Initial underlyings (csv):", underlyingsCsv);
             } else if (underlying != address(0)) {
                 console2.log("Initial underlying:", underlying);
+            }
+            if (wrappedNative != address(0)) {
+                console2.log("Wrapped native:", wrappedNative);
+                console2.log("Wrapped native payout helper:", wrappedNativeHelper);
             }
         }
     }
