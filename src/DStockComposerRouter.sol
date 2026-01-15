@@ -9,6 +9,8 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {WrappedNativePayoutHelper} from "./WrappedNativePayoutHelper.sol";
+
 /// @dev Minimal LayerZero OFT compose message decoder used by `lzCompose`.
 ///
 /// LayerZero compose payload format (EVM OFT):
@@ -89,6 +91,7 @@ interface IDStockWrapperPreview {
 /// @dev Minimal WETH9/WBNB interface for wrapping native gas token into ERC20.
 interface IWrappedNative {
     function deposit() external payable;
+    function withdraw(uint256 wad) external;
 }
 
 /// @dev LayerZero v2 compose interface (EndpointV2 calls this on the compose target).
@@ -157,8 +160,11 @@ contract DStockComposerRouter is
     /// @notice Wrapped native token (e.g., WBNB/WETH) used by `wrapAndBridgeNative`.
     /// @dev Owner must configure this and register a route via `setRouteConfig(wrappedNative, wrapper, shareAdapter)`.
     address public wrappedNative;
+    /// @notice Helper used to unwrap wrappedNative and pay native to receiver on reverse local delivery.
+    /// @dev Deployed separately; set via `setWrappedNativePayoutHelper`.
+    address public wrappedNativePayoutHelper;
 
-    uint256[49] private __gap;
+    uint256[48] private __gap;
 
     /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
@@ -255,6 +261,13 @@ contract DStockComposerRouter is
     function setWrappedNative(address wrappedNative_) external onlyOwner {
         if (wrappedNative_ == address(0)) revert ZeroAddress();
         wrappedNative = wrappedNative_;
+    }
+
+    /// @notice Configure the helper used for reverse local native delivery (WBNB/WETH -> native payout).
+    /// @dev This helper must be deployed as a standalone contract (see `src/WrappedNativePayoutHelper.sol`).
+    function setWrappedNativePayoutHelper(address helper) external onlyOwner {
+        if (helper == address(0)) revert ZeroAddress();
+        wrappedNativePayoutHelper = helper;
     }
 
     /// @notice User entry: wrap an underlying token into wrapper shares, then bridge shares via `shareAdapter`.
@@ -514,13 +527,36 @@ contract DStockComposerRouter is
                 _refundToken(r.underlying, guid, "underlying_below_min", r.refundBsc, underlyingOut);
                 return;
             }
-            // Best-effort token transfer; if it fails, refund to refundBsc.
-            bool okDeliver = _tryTransfer(r.underlying, receiver, underlyingOut);
-            if (!okDeliver) {
-                _refundToken(r.underlying, guid, "deliver_failed", r.refundBsc, underlyingOut);
-                return;
+
+            // Special case: deliver native gas token when underlying is `wrappedNative` (e.g., WBNB/WETH).
+            // Rule: `underlying == wrappedNative && finalDstEid == chainEid` => unwrap via helper + native transfer.
+            if (r.underlying == wrappedNative) {
+                address helper = wrappedNativePayoutHelper;
+                if (helper == address(0)) {
+                    _refundToken(r.underlying, guid, "native_helper_not_set", r.refundBsc, underlyingOut);
+                    return;
+                }
+
+                // Move wrapped tokens to helper, then helper unwraps and delivers native.
+                IERC20(r.underlying).safeTransfer(helper, underlyingOut);
+                bool okNative = WrappedNativePayoutHelper(payable(helper)).unwrapAndPayout(wrappedNative, receiver, r.refundBsc, underlyingOut);
+                if (!okNative) {
+                    // helper already refunded wrapped/native best-effort to refundBsc
+                    emit RouteFailed(guid, "deliver_native_failed", r.refundBsc, underlyingOut);
+                    _refundNative(r.refundBsc);
+                    return;
+                }
+
+                emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
+            } else {
+                // Best-effort token transfer; if it fails, refund to refundBsc.
+                bool okDeliver = _tryTransfer(r.underlying, receiver, underlyingOut);
+                if (!okDeliver) {
+                    _refundToken(r.underlying, guid, "deliver_failed", r.refundBsc, underlyingOut);
+                    return;
+                }
+                emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
             }
-            emit UnwrappedAndForwarded(guid, r.finalDstEid, r.finalTo, sharesIn, underlyingOut);
         } else {
             // Cross-chain delivery: send underlying via its OFT interface (second hop).
             bool ok2 = _sendUnderlyingToFinal(r.underlying, guid, sharesIn, underlyingOut, r);

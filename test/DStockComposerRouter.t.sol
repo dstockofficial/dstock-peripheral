@@ -15,6 +15,13 @@ import {MockComposerWrapperNoOpUnwrap} from "./mocks/MockComposerWrapperNoOpUnwr
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockERC20Blocklist} from "./mocks/MockERC20Blocklist.sol";
 import {MockWETH9} from "./mocks/MockWETH9.sol";
+import {WrappedNativePayoutHelper} from "../src/WrappedNativePayoutHelper.sol";
+
+contract RejectEther {
+    receive() external payable {
+        revert("no_eth");
+    }
+}
 
 contract DStockComposerRouterTest is Test {
     address internal constant ENDPOINT = address(0xE11D);
@@ -56,6 +63,7 @@ contract DStockComposerRouterTest is Test {
         wnative = new MockWETH9();
         wrapper.setUnderlyingDecimals(address(wnative), 18);
         router.setWrappedNative(address(wnative));
+        router.setWrappedNativePayoutHelper(address(new WrappedNativePayoutHelper()));
         router.setRouteConfig(address(wnative), address(wrapper), address(shareAdapter));
     }
 
@@ -222,6 +230,75 @@ contract DStockComposerRouterTest is Test {
 
         vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
         r2.wrapAndBridgeNative{value: 1 ether}(1 ether, 30367, bytes32(uint256(1)), "");
+    }
+
+    function test_lzCompose_reverse_deliverLocal_native_whenUnderlyingIsWrappedNative() public {
+        address receiver = address(0xCAFE);
+
+        // provide wrapped-native liquidity to wrapper
+        uint256 liquidity = 2000 ether;
+        vm.deal(address(wrapper), liquidity);
+        vm.prank(address(wrapper));
+        wnative.deposit{value: liquidity}();
+
+        // credit router shares
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(wnative),
+            finalDstEid: CHAIN_EID,
+            finalTo: bytes32(uint256(uint160(receiver))),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidNativeOk"), sharesIn, abi.encode(rr));
+
+        uint256 pre = receiver.balance;
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidNativeOk"), message, address(0), "");
+
+        assertEq(receiver.balance, pre + sharesIn);
+        assertEq(wnative.balanceOf(receiver), 0);
+        assertEq(wnative.balanceOf(address(router)), 0);
+    }
+
+    function test_lzCompose_reverse_deliverLocal_native_fail_refundsWrappedNative() public {
+        RejectEther reject = new RejectEther();
+        address receiver = address(reject);
+
+        // provide wrapped-native liquidity to wrapper
+        uint256 liquidity = 2000 ether;
+        vm.deal(address(wrapper), liquidity);
+        vm.prank(address(wrapper));
+        wnative.deposit{value: liquidity}();
+
+        // credit router shares
+        uint256 sharesIn = 1000e18;
+        wrapper.mintShares(address(router), sharesIn);
+
+        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+            underlying: address(wnative),
+            finalDstEid: CHAIN_EID,
+            finalTo: bytes32(uint256(uint160(receiver))),
+            refundBsc: REFUND,
+            unwrapBps: 10_000,
+            minAmountLD2: 0,
+            extraOptions2: "",
+            composeMsg2: ""
+        });
+        (, bytes memory message) = _compose(bytes32("guidNativeFail"), sharesIn, abi.encode(rr));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(shareAdapter), bytes32("guidNativeFail"), message, address(0), "");
+
+        // native send failed; wrapped token refunded to refund address
+        assertEq(REFUND.balance, 0);
+        assertEq(wnative.balanceOf(REFUND), sharesIn);
+        assertEq(receiver.balance, 0);
     }
 
     function test_wrapAndBridge_revertIfInvalidUnderlyingConfig() public {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// @dev Minimal WETH9-style wrapper (deposit-only) for tests.
+/// @dev Minimal WETH9-style wrapper for tests.
 /// - `deposit()` mints ERC20 1:1 to msg.sender
+/// - `withdraw(wad)` burns from msg.sender and sends native
 /// - `transfer/transferFrom/approve` implemented
 contract MockWETH9 {
     string public name = "Mock Wrapped Native";
@@ -18,6 +19,15 @@ contract MockWETH9 {
     function deposit() external payable {
         balanceOf[msg.sender] += msg.value;
         emit Transfer(address(0), msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 wad) external {
+        require(balanceOf[msg.sender] >= wad, "balance");
+        unchecked {
+            balanceOf[msg.sender] -= wad;
+        }
+        emit Transfer(msg.sender, address(0), wad);
+        payable(msg.sender).transfer(wad);
     }
 
     function approve(address spender, uint256 amount) external returns (bool) {
@@ -47,5 +57,7 @@ contract MockWETH9 {
         }
         emit Transfer(from, to, amount);
     }
+
+    receive() external payable {}
 }
 

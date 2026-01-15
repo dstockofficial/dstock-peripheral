@@ -7,13 +7,16 @@ Peripheral contracts for the DStock ecosystem, providing LayerZero-integrated br
 This repository contains contracts that enable:
 
 - **One-click wrap and bridge**: Wrap underlying tokens (BSC-local ERC20 or OFT assets) and bridge shares to destination chains in a single transaction
+- **One-click wrap and bridge (native)**: Wrap native gas token (BNB/ETH) into WBNB/WETH and bridge shares in a single transaction
 - **Automatic unwrapping**: LayerZero compose messages can trigger unwrapping of shares into the configured underlying token (and optionally deliver locally on the same chain)
 
 ## Contracts
 
 - **DStockComposerRouter**: Unified router that supports:
   - user-initiated wrap + bridge (`wrapAndBridge`, `quoteWrapAndBridge`)
+  - user-initiated native wrap + bridge (`wrapAndBridgeNative`)
   - LayerZero compose handling for forward and reverse routes (`lzCompose`)
+  - reverse local native delivery when `ReverseRouteMsg.underlying == wrappedNative` and `finalDstEid == chainEid`
 
 ## How it works (quick mental model)
 
@@ -50,6 +53,23 @@ The router uses a minimal registry. The owner configures routes via:
 Notes:
 - A single `(wrapper, shareAdapter)` pair can be reused by multiple underlyings (call `setRouteConfig` multiple times).
 - `underlying` can be a **BSC-local ERC20** or an **EVM OFT token/adapter** address, as long as the wrapper supports it.
+
+### Wrapped native configuration (BNB/ETH)
+
+To support native gas token flows:
+
+- **User entry (native -> shares -> bridge)**:
+  - Set wrapped native token: `setWrappedNative(WBNB_or_WETH)`
+  - Register route for wrapped native (required by `wrapAndBridgeNative`): `setRouteConfig(WBNB_or_WETH, wrapper, shareAdapter)`
+
+- **Reverse local native delivery (shares -> WBNB/WETH -> native payout)**:
+  - Deploy helper contract `WrappedNativePayoutHelper`
+  - Set it on router: `setWrappedNativePayoutHelper(helperAddress)`
+  - In `ReverseRouteMsg`, set `underlying = WBNB_or_WETH` and `finalDstEid = chainEid`
+
+Why the helper is required:
+- Standard WETH9/WBNB `withdraw()` uses `transfer` (2300 gas). When the router is behind a proxy, receiving native via `transfer` can fail.
+- The helper is a non-proxy contract that safely receives the native from `withdraw()` and forwards it to the final receiver.
 
 ## Compose payloads (RouteMsg / ReverseRouteMsg)
 
@@ -115,6 +135,8 @@ OWNER_ADDRESS=<router_owner_address> \
 WRAPPER_ADDRESS=<dstock_wrapper_address_optional> \
 SHARE_ADAPTER_ADDRESS=<shares_oft_adapter_address_optional> \
 UNDERLYING_ADDRESS=<underlying_token_address_optional> \
+WRAPPED_NATIVE_ADDRESS=<wbnb_or_weth_optional> \
+WRAPPED_NATIVE_PAYOUT_HELPER_ADDRESS=<optional_predeployed_helper_address> \
 forge script script/DeployComposerRouterProxy.s.sol:DeployComposerRouterProxy \
   --rpc-url <your_rpc_url> \
   --broadcast \
