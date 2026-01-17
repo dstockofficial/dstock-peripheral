@@ -133,7 +133,8 @@ contract DStockComposerRouterTest is Test {
             amount,
             30367,
             bytes32(uint256(uint160(address(0xB0B)))) ,
-            ""
+            "",
+            expectedShares
         );
         vm.stopPrank();
 
@@ -153,7 +154,7 @@ contract DStockComposerRouterTest is Test {
         localUnderlying.approve(address(router), amount);
 
         uint256 pre = user.balance;
-        router.wrapAndBridge{value: 0.5 ether}(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "");
+        router.wrapAndBridge{value: 0.5 ether}(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "", 0);
         uint256 post = user.balance;
         assertEq(post, pre - 0.1 ether);
         vm.stopPrank();
@@ -178,7 +179,7 @@ contract DStockComposerRouterTest is Test {
         DStockComposerRouter r2 = DStockComposerRouter(payable(address(proxy)));
 
         vm.expectRevert(DStockComposerRouter.WrappedNativeNotSet.selector);
-        r2.wrapAndBridgeNative{value: 1}(1, 30367, bytes32(uint256(1)), "");
+        r2.wrapAndBridgeNative{value: 1}(1, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridgeNative_success_andRefundsExcessFee() public {
@@ -190,7 +191,8 @@ contract DStockComposerRouterTest is Test {
 
         uint256 pre = user.balance;
         vm.prank(user);
-        uint256 sharesSent = router.wrapAndBridgeNative{value: 1.5 ether}(amountNative, 30367, bytes32(uint256(uint160(user))), "");
+        uint256 sharesSent =
+            router.wrapAndBridgeNative{value: 1.5 ether}(amountNative, 30367, bytes32(uint256(uint160(user))), "", amountNative);
 
         // wrapper mints shares 1:1 for 18-decimal underlying
         assertEq(sharesSent, amountNative);
@@ -204,7 +206,7 @@ contract DStockComposerRouterTest is Test {
 
         vm.prank(user);
         vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.5 ether, 1 ether));
-        router.wrapAndBridgeNative{value: 0.5 ether}(1 ether, 30367, bytes32(uint256(1)), "");
+        router.wrapAndBridgeNative{value: 0.5 ether}(1 ether, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridgeNative_revertIfInsufficientFeeForSend() public {
@@ -215,7 +217,7 @@ contract DStockComposerRouterTest is Test {
         vm.deal(user, 2 ether);
         vm.prank(user);
         vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.05 ether, 0.2 ether));
-        router.wrapAndBridgeNative{value: 1.05 ether}(amountNative, 30367, bytes32(uint256(1)), "");
+        router.wrapAndBridgeNative{value: 1.05 ether}(amountNative, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridgeNative_revertIfInvalidOAppConfig() public {
@@ -229,7 +231,7 @@ contract DStockComposerRouterTest is Test {
         r2.setWrappedNative(address(w2));
 
         vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
-        r2.wrapAndBridgeNative{value: 1 ether}(1 ether, 30367, bytes32(uint256(1)), "");
+        r2.wrapAndBridgeNative{value: 1 ether}(1 ether, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_lzCompose_reverse_deliverLocal_native_whenUnderlyingIsWrappedNative() public {
@@ -301,17 +303,17 @@ contract DStockComposerRouterTest is Test {
 
     function test_wrapAndBridge_revertIfInvalidUnderlyingConfig() public {
         vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
-        router.wrapAndBridge(address(0xBADD), 1, 30367, bytes32(uint256(1)), "");
+        router.wrapAndBridge(address(0xBADD), 1, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridge_revertIfAmountZero() public {
         vm.expectRevert(DStockComposerRouter.AmountZero.selector);
-        router.wrapAndBridge(address(localUnderlying), 0, 30367, bytes32(uint256(1)), "");
+        router.wrapAndBridge(address(localUnderlying), 0, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridge_revertIfInvalidRecipient() public {
         vm.expectRevert(DStockComposerRouter.InvalidRecipient.selector);
-        router.wrapAndBridge(address(localUnderlying), 1, 30367, bytes32(0), "");
+        router.wrapAndBridge(address(localUnderlying), 1, 30367, bytes32(0), "", 0);
     }
 
     function test_wrapAndBridge_revertIfInsufficientFee() public {
@@ -325,7 +327,25 @@ contract DStockComposerRouterTest is Test {
         vm.startPrank(user);
         localUnderlying.approve(address(router), amount);
         vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.5 ether, 1 ether));
-        router.wrapAndBridge{value: 0.5 ether}(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "");
+        router.wrapAndBridge{value: 0.5 ether}(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "", 0);
+        vm.stopPrank();
+    }
+
+    function test_wrapAndBridge_revertIfInsufficientAmount() public {
+        address user = address(0xCAFE);
+        uint256 amount = 10e6; // 6 decimals
+        uint256 expectedSentLD = amount * 1e12; // scaled to 18 decimals by MockComposerWrapper
+
+        localUnderlying.mint(user, amount);
+        shareAdapter.setFee(0);
+        vm.deal(user, 1 ether);
+
+        vm.startPrank(user);
+        localUnderlying.approve(address(router), amount);
+        vm.expectRevert(
+            abi.encodeWithSelector(DStockComposerRouter.InsufficientAmount.selector, expectedSentLD, expectedSentLD + 1)
+        );
+        router.wrapAndBridge(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "", expectedSentLD + 1);
         vm.stopPrank();
     }
 

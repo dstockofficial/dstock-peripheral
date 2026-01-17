@@ -23,7 +23,7 @@ This repository contains contracts that enable:
 `DStockComposerRouter` supports two kinds of entrypoints:
 
 - **User entry (EOA calls)**:
-  - `wrapAndBridge(underlying, amount, dstEid, to, extraOptions)`
+  - `wrapAndBridge(underlying, amount, dstEid, to, extraOptions, minAmountLD)`
   - `quoteWrapAndBridge(underlying, amount, dstEid, to, extraOptions)`
 
 - **Compose entry (LayerZero Endpoint calls)**:

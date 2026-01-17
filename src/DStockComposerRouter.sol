@@ -186,6 +186,8 @@ contract DStockComposerRouter is
     error InvalidRefundAddress();
     error AmountZero();
     error InvalidRecipient();
+    /// @notice Thrown when the wrapped share amount is lower than the user-specified minimum.
+    error InsufficientAmount(uint256 amountSentLD, uint256 minAmountLD);
     error InsufficientFee(uint256 provided, uint256 required);
     error RefundFailedNative();
     error WrappedNativeNotSet();
@@ -274,12 +276,14 @@ contract DStockComposerRouter is
     /// @param dstEid Destination EID for shares
     /// @param to Recipient on destination chain (bytes32-encoded)
     /// @param extraOptions LayerZero options for `shareAdapter.send`
+    /// @param minAmountLD Minimum wrapper-share amount to bridge (slippage protection; 0 = accept any)
     function wrapAndBridge(
         address underlying,
         uint256 amount,
         uint32 dstEid,
         bytes32 to,
-        bytes calldata extraOptions
+        bytes calldata extraOptions,
+        uint256 minAmountLD
     ) external payable nonReentrant returns (uint256 amountSentLD) {
         if (amount == 0) revert AmountZero();
         if (to == bytes32(0)) revert InvalidRecipient();
@@ -294,6 +298,7 @@ contract DStockComposerRouter is
         (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(underlying, amount, address(this));
         amountSentLD = net18;
         if (amountSentLD == 0) revert AmountZero();
+        if (amountSentLD < minAmountLD) revert InsufficientAmount(amountSentLD, minAmountLD);
 
         IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
 
@@ -301,7 +306,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: amountSentLD,
+            minAmountLD: minAmountLD,
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -325,7 +330,8 @@ contract DStockComposerRouter is
         uint256 amountNative,
         uint32 dstEid,
         bytes32 to,
-        bytes calldata extraOptions
+        bytes calldata extraOptions,
+        uint256 minAmountLD
     ) external payable nonReentrant returns (uint256 amountSentLD) {
         if (amountNative == 0) revert AmountZero();
         if (to == bytes32(0)) revert InvalidRecipient();
@@ -346,6 +352,7 @@ contract DStockComposerRouter is
         (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(w, amountNative, address(this));
         amountSentLD = net18;
         if (amountSentLD == 0) revert AmountZero();
+        if (amountSentLD < minAmountLD) revert InsufficientAmount(amountSentLD, minAmountLD);
 
         IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
 
@@ -353,7 +360,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: amountSentLD,
+            minAmountLD: minAmountLD,
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
