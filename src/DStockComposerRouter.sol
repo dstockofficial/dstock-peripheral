@@ -412,7 +412,7 @@ contract DStockComposerRouter is
     ///
     /// Important parameters (LayerZero terminology):
     /// - `_oApp`: the OApp address associated with the compose call.
-    ///   - Forward: `_oApp == underlying` (the token credited to this router)
+    ///   - Forward: `_oApp == underlying oft` (the token credited to this router)
     ///   - Reverse: `_oApp == shareAdapter` (shares adapter credited shares to this router)
     /// - `_guid`: globally unique message id used for idempotency (`processedGuids`)
     /// - `_message`: OFT compose payload, decoded via `OFTComposeMsgCodecLite` to extract `amountLD` and `composeMsg`.
@@ -443,7 +443,7 @@ contract DStockComposerRouter is
             return;
         }
 
-        // Forward: _oApp is the underlying token (OFT or local ERC20) that was credited to this router
+        // Forward: _oApp is the underlying token (OFT token) that was credited to this router
         address shareAdapter = underlyingToShareAdapter[_oApp];
         wrapper = underlyingToWrapper[_oApp];
         if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
