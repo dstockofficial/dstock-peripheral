@@ -140,6 +140,7 @@ contract DStockComposerRouterTest is Test {
 
         assertEq(sent, expectedShares);
         assertEq(wrapper.balanceOf(address(shareAdapter)), expectedShares);
+        assertEq(wrapper.allowance(address(router), address(shareAdapter)), 0);
     }
 
     function test_wrapAndBridge_user_refundExcessNative() public {
@@ -196,6 +197,7 @@ contract DStockComposerRouterTest is Test {
 
         // wrapper mints shares 1:1 for 18-decimal underlying
         assertEq(sharesSent, amountNative);
+        assertEq(wrapper.allowance(address(router), address(shareAdapter)), 0);
         // net cost = amountNative + fee (refund excess fee)
         assertEq(user.balance, pre - 1.1 ether);
     }
@@ -466,6 +468,7 @@ contract DStockComposerRouterTest is Test {
 
         assertEq(wrapper.balanceOf(REFUND), expectedShares);
         assertEq(wrapper.balanceOf(address(router)), 0);
+        assertEq(wrapper.allowance(address(router), address(badAdapter)), 0);
     }
 
     function test_lzCompose_forward_refundsLeftoverNativeToRefundBsc() public {

@@ -316,6 +316,7 @@ contract DStockComposerRouter is
         if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
 
         IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        _revokeApproval(wrapper, shareAdapter);
 
         uint256 refund = msg.value - fee.nativeFee;
         if (refund > 0) {
@@ -371,6 +372,7 @@ contract DStockComposerRouter is
         if (availableFee < fee.nativeFee) revert InsufficientFee(availableFee, fee.nativeFee);
 
         IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        _revokeApproval(wrapper, shareAdapter);
 
         uint256 refund = availableFee - fee.nativeFee;
         if (refund > 0) {
@@ -629,9 +631,11 @@ contract DStockComposerRouter is
         IERC20(wrapper).forceApprove(shareAdapter, sharesOut);
 
         try IOFTLike(shareAdapter).send{value: fee2.nativeFee}(sp, fee2, refundBsc) {
+            _revokeApproval(wrapper, shareAdapter);
             emit WrappedAndForwarded(guid, finalDstEid, finalTo, underlyingIn, sharesOut);
             return true;
         } catch {
+            _revokeApproval(wrapper, shareAdapter);
             _refundToken(wrapper, guid, "send2_failed", refundBsc, sharesOut);
             return false;
         }
@@ -757,6 +761,13 @@ contract DStockComposerRouter is
         uint256 bal = address(this).balance;
         if (bal == 0) return;
         (bool ok, ) = to.call{value: bal}("");
+        ok;
+    }
+
+    /// @dev Used to avoid leaving residual approvals.
+    function _revokeApproval(address token, address spender) internal {
+        // ignore both revert and false return values
+        (bool ok, ) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
         ok;
     }
 
