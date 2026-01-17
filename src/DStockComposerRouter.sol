@@ -164,7 +164,7 @@ contract DStockComposerRouter is
     /// @dev Deployed separately; set via `setWrappedNativePayoutHelper`.
     address public wrappedNativePayoutHelper;
 
-    uint256[48] private __gap;
+    uint256[43] private __gap;
 
     /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
