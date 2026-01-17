@@ -10,6 +10,7 @@ import {MockOFTLikeToken} from "./mocks/MockOFTLikeToken.sol";
 import {MockOFTLikeAdapter} from "./mocks/MockOFTLikeAdapter.sol";
 import {MockOFTLikeAdapterRevertSend} from "./mocks/MockOFTLikeAdapterRevertSend.sol";
 import {MockOFTLikeTokenRevertSend} from "./mocks/MockOFTLikeTokenRevertSend.sol";
+import {MockComposerWrapperZeroShares} from "./mocks/MockComposerWrapperZeroShares.sol";
 import {MockComposerWrapper} from "./mocks/MockComposerWrapper.sol";
 import {MockComposerWrapperNoOpUnwrap} from "./mocks/MockComposerWrapperNoOpUnwrap.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -514,6 +515,30 @@ contract DStockComposerRouterTest is Test {
         assertEq(underlyingOft.balanceOf(address(wrapper)), amountUnderlying);
         assertEq(wrapper.balanceOf(address(shareAdapter)), expectedShares);
         assertEq(wrapper.balanceOf(address(router)), 0);
+    }
+
+    function test_lzCompose_forward_wrapZeroShares_underlyingSpent_doesNotOverRefund() public {
+        uint256 amountUnderlying = 10e6;
+
+        // Router has MORE underlying than the credited amount, so an over-refund would drain router funds.
+        underlyingOft.mint(address(router), amountUnderlying * 2);
+
+        // Wrapper consumes underlying but mints 0 shares (rounding-to-zero scenario)
+        MockComposerWrapperZeroShares z = new MockComposerWrapperZeroShares();
+        router.setRouteConfig(address(underlyingOft), address(z), address(shareAdapter));
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidWrapZeroUnderlyingSpent"), amountUnderlying, abi.encode(r));
+
+        vm.prank(ENDPOINT);
+        router.lzCompose(address(underlyingOft), bytes32("guidWrapZeroUnderlyingSpent"), message, address(0), "");
+
+        // Wrapper pulled only the credited amount; router keeps its remaining balance (no over-refund).
+        assertEq(underlyingOft.balanceOf(address(z)), amountUnderlying);
+        assertEq(underlyingOft.balanceOf(address(router)), amountUnderlying);
+        assertEq(underlyingOft.balanceOf(REFUND), 0);
+        assertEq(underlyingOft.allowance(address(router), address(z)), 0);
     }
 
     // pause behavior removed in minimal-mapping router

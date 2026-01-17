@@ -568,7 +568,8 @@ contract DStockComposerRouter is
         _refundNative(r.refundBsc);
     }
 
-    /// @dev Wrap underlying into wrapper shares. On failure, attempts to refund `underlyingAmount` to `refundBsc`.
+    /// @dev Wrap underlying into wrapper shares.
+    /// On failure, attempts to refund only what remains on this router (prevents over-refund).
     function _wrapUnderlying(address wrapper, address underlying, bytes32 guid, uint256 underlyingAmount, address refundBsc)
         internal
         returns (uint256)
@@ -583,14 +584,34 @@ contract DStockComposerRouter is
         // Approve wrapper to pull the underlying for wrapping.
         IERC20(underlying).forceApprove(wrapper, underlyingAmount);
 
+        // Track router underlying balance delta to avoid over-refund on rounding-to-zero shares.
+        uint256 uBefore = balUnderlying;
+
         // Measure shares minted to this router (supports wrappers that don't return exact values).
         uint256 shareBalBefore = IERC20(wrapper).balanceOf(address(this));
         IDStockWrapperLike(wrapper).wrap(underlying, underlyingAmount, address(this));
         uint256 shareBalAfter = IERC20(wrapper).balanceOf(address(this));
         uint256 sharesOut = shareBalAfter - shareBalBefore;
 
+        uint256 uAfter = IERC20(underlying).balanceOf(address(this));
+
+        // optional but good hygiene: revoke approval to wrapper
+        IERC20(underlying).forceApprove(wrapper, 0);
+
         if (sharesOut == 0) {
-            _refundToken(underlying, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
+            // If underlying was NOT consumed, safe to refund requested amount (capped by current balance).
+            if (uAfter >= uBefore) {
+                uint256 refundAmt = uAfter < underlyingAmount ? uAfter : underlyingAmount;
+                if (refundAmt > 0) {
+                    _refundToken(underlying, guid, "wrap_zero_shares", refundBsc, refundAmt);
+                } else {
+                    _fail(guid, "wrap_zero_shares_no_balance", refundBsc, 0);
+                }
+                return 0;
+            }
+
+            // If underlying WAS consumed but shares minted rounded to 0, do NOT refund underlyingAmount.
+            _fail(guid, "wrap_zero_shares_underlying_spent", refundBsc, underlyingAmount);
             return 0;
         }
         return sharesOut;
