@@ -226,6 +226,11 @@ contract DStockComposerRouter is
         bytes composeMsg2;
     }
 
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+    
     /// @notice UUPS initializer (called once via proxy).
     /// @param _endpoint LayerZero EndpointV2 address on this chain
     /// @param _chainEid LayerZero EID for this chain

@@ -79,13 +79,18 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_initialize_revertIfZeroEndpointOrOwner() public {
+        // After Recommendation-1 we disable initializers on the implementation contract.
+        // Therefore `initialize(...)` MUST be invoked via proxy to test ZeroAddress validation.
+
         DStockComposerRouter i = new DStockComposerRouter();
+        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (address(0), CHAIN_EID, address(this)));
         vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
-        i.initialize(address(0), CHAIN_EID, address(this));
+        new ERC1967Proxy(address(i), initData);
 
         i = new DStockComposerRouter();
+        initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(0)));
         vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
-        i.initialize(ENDPOINT, CHAIN_EID, address(0));
+        new ERC1967Proxy(address(i), initData);
     }
 
     function test_registryMappings_written() public view {
