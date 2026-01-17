@@ -86,7 +86,6 @@ The router expects `composeMsg` to be ABI-encoded structs:
   - `finalDstEid`: final destination EID for underlying (second hop); if equals `chainEid`, deliver locally
   - `finalTo`: bytes32 recipient; if delivering locally, it must encode an EVM address
   - `refundBsc`: EVM address on this chain to receive refunds on failures
-  - `unwrapBps`: unwrap fraction in basis points (1..10000)
   - `minAmountLD2`: min underlying for second hop (0 = accept full amount)
   - `extraOptions2`: LayerZero options for the second hop
   - `composeMsg2`: compose payload for the second hop (optional)

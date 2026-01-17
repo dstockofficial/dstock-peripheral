@@ -212,8 +212,6 @@ contract DStockComposerRouter is
         bytes32 finalTo;
         /// @notice EVM address on this chain used for refunding tokens/native fees if something fails.
         address refundBsc;
-        /// @notice Portion of shares to unwrap, in basis points (1..10000).
-        uint16 unwrapBps;
         /// @notice Minimum underlying for the second hop (0 = accept unwrapped amount).
         uint256 minAmountLD2;
         /// @notice LayerZero options for the second hop (underlying.send).
@@ -505,14 +503,9 @@ contract DStockComposerRouter is
             _refundToken(wrapper, guid, "underlying_zero", r.refundBsc, sharesIn);
             return;
         }
-        if (r.unwrapBps == 0 || r.unwrapBps > 10_000) {
-            // Unwrap fraction is expressed in bps (1..10000).
-            _refundToken(wrapper, guid, "bad_unwrap_bps", r.refundBsc, sharesIn);
-            return;
-        }
 
         // 1) Unwrap shares into underlying.
-        uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc, r.unwrapBps);
+        uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc);
         if (underlyingOut == 0) return;
 
         if (r.finalDstEid == chainEid) {
@@ -647,9 +640,9 @@ contract DStockComposerRouter is
         return abi.decode(inner, (ReverseRouteMsg));
     }
 
-    /// @dev Unwrap `sharesIn * unwrapBps/10000` shares into underlying.
+    /// @dev Unwrap `sharesIn` shares into underlying.
     /// On unwrap failure, refunds the full `sharesIn` (shares token) to `refundBsc`.
-    function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
+    function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc)
         internal
         returns (uint256)
     {
@@ -660,9 +653,8 @@ contract DStockComposerRouter is
             return 0;
         }
 
-        // We may choose to unwrap only a fraction of shares (basis points).
-        uint256 attemptUnderlying = (sharesIn * uint256(unwrapBps)) / 10_000;
-        if (attemptUnderlying == 0) {
+        uint256 sharesToUnwrap = sharesIn;
+        if (sharesToUnwrap == 0) {
             _refundToken(wrapper, guid, "unwrap_zero_amount", refundBsc, sharesIn);
             return 0;
         }
@@ -670,7 +662,7 @@ contract DStockComposerRouter is
         // Track underlying delta to compute actual output.
         uint256 underlyingBalBefore = IERC20(underlying).balanceOf(address(this));
 
-        try IDStockWrapperLike(wrapper).unwrap(underlying, attemptUnderlying, address(this)) {} catch {
+        try IDStockWrapperLike(wrapper).unwrap(underlying, sharesToUnwrap, address(this)) {} catch {
             _refundToken(wrapper, guid, "unwrap_failed", refundBsc, sharesIn);
             return 0;
         }

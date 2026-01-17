@@ -250,7 +250,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -285,7 +284,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -540,7 +538,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -578,7 +575,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: address(0),
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -601,7 +597,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -610,28 +605,6 @@ contract DStockComposerRouterTest is Test {
 
         vm.prank(ENDPOINT);
         router.lzCompose(address(shareAdapter), bytes32("guidUnder0"), message, address(0), "");
-
-        assertEq(wrapper.balanceOf(REFUND), sharesIn);
-    }
-
-    function test_lzCompose_reverse_badUnwrapBps_refundsShares() public {
-        uint256 sharesIn = 1000e18;
-        wrapper.mintShares(address(router), sharesIn);
-
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
-            underlying: address(underlyingOft),
-            finalDstEid: 40168,
-            finalTo: bytes32(uint256(123)),
-            refundBsc: REFUND,
-            unwrapBps: 0,
-            minAmountLD2: 0,
-            extraOptions2: "",
-            composeMsg2: ""
-        });
-        (, bytes memory message) = _compose(bytes32("guidBps0"), sharesIn, abi.encode(rr));
-
-        vm.prank(ENDPOINT);
-        router.lzCompose(address(shareAdapter), bytes32("guidBps0"), message, address(0), "");
 
         assertEq(wrapper.balanceOf(REFUND), sharesIn);
     }
@@ -645,7 +618,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -657,28 +629,6 @@ contract DStockComposerRouterTest is Test {
 
         vm.prank(ENDPOINT);
         router.lzCompose(address(shareAdapter), bytes32("guidNoShares"), message, address(0), "");
-    }
-
-    function test_lzCompose_reverse_unwrapZeroAmount_refundsShares() public {
-        uint256 sharesIn = 1; // 1 wei share
-        wrapper.mintShares(address(router), sharesIn);
-
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
-            underlying: address(underlyingOft),
-            finalDstEid: 40168,
-            finalTo: bytes32(uint256(123)),
-            refundBsc: REFUND,
-            unwrapBps: 1, // 0.01% => floor to 0
-            minAmountLD2: 0,
-            extraOptions2: "",
-            composeMsg2: ""
-        });
-        (, bytes memory message) = _compose(bytes32("guidZeroAmt"), sharesIn, abi.encode(rr));
-
-        vm.prank(ENDPOINT);
-        router.lzCompose(address(shareAdapter), bytes32("guidZeroAmt"), message, address(0), "");
-
-        assertEq(wrapper.balanceOf(REFUND), sharesIn);
     }
 
     function test_lzCompose_reverse_unwrapZeroOut_refundsShares() public {
@@ -696,7 +646,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -725,7 +674,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -754,7 +702,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 2000e6, // larger than unwrapped amount
             extraOptions2: "",
             composeMsg2: ""
@@ -789,7 +736,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -818,7 +764,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(0), // receiver == address(0)
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -846,7 +791,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 2000e6, // larger than unwrapped amount
             extraOptions2: "",
             composeMsg2: ""
@@ -871,7 +815,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -902,7 +845,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -928,7 +870,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(1)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 0,
             extraOptions2: "",
             composeMsg2: ""
@@ -956,7 +897,6 @@ contract DStockComposerRouterTest is Test {
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
             refundBsc: REFUND,
-            unwrapBps: 10_000,
             minAmountLD2: 9,
             extraOptions2: hex"01",
             composeMsg2: hex"02"
@@ -966,7 +906,6 @@ contract DStockComposerRouterTest is Test {
         assertEq(rr2.finalDstEid, rr.finalDstEid);
         assertEq(rr2.finalTo, rr.finalTo);
         assertEq(rr2.refundBsc, rr.refundBsc);
-        assertEq(rr2.unwrapBps, rr.unwrapBps);
         assertEq(rr2.minAmountLD2, rr.minAmountLD2);
         assertEq(rr2.extraOptions2, rr.extraOptions2);
         assertEq(rr2.composeMsg2, rr.composeMsg2);
