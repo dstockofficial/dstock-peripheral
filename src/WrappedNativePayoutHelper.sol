@@ -29,6 +29,21 @@ interface IWrappedNativeLike {
  * The helper is stateless and permissionless; router should store its address and call it as needed.
  */
 contract WrappedNativePayoutHelper {
+    error NotRouter();
+    error ZeroRouter();
+
+    address public immutable router;
+
+    constructor(address _router) {
+        if (_router == address(0)) revert ZeroRouter();
+        router = _router;
+    }
+
+    modifier onlyRouter() {
+        if (msg.sender != router) revert NotRouter();
+        _;
+    }
+
     /// @notice Unwrap `amount` of `wrappedNative` into native and send to `receiver`.
     /// @dev Assumes this helper already holds `amount` of `wrappedNative`.
     /// @return ok True if native was delivered to `receiver`. False if refund path was taken.
@@ -37,7 +52,7 @@ contract WrappedNativePayoutHelper {
         address receiver,
         address refundBsc,
         uint256 amount
-    ) external returns (bool ok) {
+    ) external onlyRouter returns (bool ok) {
         // 1) unwrap into native on this helper
         try IWrappedNativeLike(wrappedNative).withdraw(amount) {} catch {
             _tryTransfer(wrappedNative, refundBsc, amount);

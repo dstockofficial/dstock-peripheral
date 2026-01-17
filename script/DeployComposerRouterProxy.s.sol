@@ -79,7 +79,7 @@ contract DeployComposerRouterProxy is Script {
 
                 // If helper isn't provided, deploy one now.
                 if (wrappedNativeHelper == address(0)) {
-                    WrappedNativePayoutHelper helper = new WrappedNativePayoutHelper();
+                    WrappedNativePayoutHelper helper = new WrappedNativePayoutHelper(address(proxy));
                     wrappedNativeHelper = address(helper);
                 }
                 router.setWrappedNativePayoutHelper(wrappedNativeHelper);

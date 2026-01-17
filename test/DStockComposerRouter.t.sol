@@ -64,7 +64,7 @@ contract DStockComposerRouterTest is Test {
         wnative = new MockWETH9();
         wrapper.setUnderlyingDecimals(address(wnative), 18);
         router.setWrappedNative(address(wnative));
-        router.setWrappedNativePayoutHelper(address(new WrappedNativePayoutHelper()));
+        router.setWrappedNativePayoutHelper(address(new WrappedNativePayoutHelper(address(router))));
         router.setRouteConfig(address(wnative), address(wrapper), address(shareAdapter));
     }
 
