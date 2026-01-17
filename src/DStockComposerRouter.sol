@@ -164,7 +164,11 @@ contract DStockComposerRouter is
     /// @dev Deployed separately; set via `setWrappedNativePayoutHelper`.
     address public wrappedNativePayoutHelper;
 
-    uint256[48] private __gap;
+    /// @dev Floor for native refunds during `lzCompose` (audit Issue-2).
+    /// Tracks the router's pre-existing native balance to avoid over-refunding.
+    uint256 private _nativeRefundFloor;
+
+    uint256[42] private __gap;
 
     /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
@@ -186,6 +190,8 @@ contract DStockComposerRouter is
     error InvalidRefundAddress();
     error AmountZero();
     error InvalidRecipient();
+    /// @notice Thrown when the wrapped share amount is lower than the user-specified minimum.
+    error InsufficientAmount(uint256 amountSentLD, uint256 minAmountLD);
     error InsufficientFee(uint256 provided, uint256 required);
     error RefundFailedNative();
     error WrappedNativeNotSet();
@@ -212,14 +218,17 @@ contract DStockComposerRouter is
         bytes32 finalTo;
         /// @notice EVM address on this chain used for refunding tokens/native fees if something fails.
         address refundBsc;
-        /// @notice Portion of shares to unwrap, in basis points (1..10000).
-        uint16 unwrapBps;
         /// @notice Minimum underlying for the second hop (0 = accept unwrapped amount).
         uint256 minAmountLD2;
         /// @notice LayerZero options for the second hop (underlying.send).
         bytes extraOptions2;
         /// @notice Optional compose payload for the second hop (underlying.send).
         bytes composeMsg2;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
     }
 
     /// @notice UUPS initializer (called once via proxy).
@@ -276,12 +285,14 @@ contract DStockComposerRouter is
     /// @param dstEid Destination EID for shares
     /// @param to Recipient on destination chain (bytes32-encoded)
     /// @param extraOptions LayerZero options for `shareAdapter.send`
+    /// @param minAmountLD Minimum wrapper-share amount to bridge (slippage protection; 0 = accept any)
     function wrapAndBridge(
         address underlying,
         uint256 amount,
         uint32 dstEid,
         bytes32 to,
-        bytes calldata extraOptions
+        bytes calldata extraOptions,
+        uint256 minAmountLD
     ) external payable nonReentrant returns (uint256 amountSentLD) {
         if (amount == 0) revert AmountZero();
         if (to == bytes32(0)) revert InvalidRecipient();
@@ -303,7 +314,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: amountSentLD,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -312,7 +323,13 @@ contract DStockComposerRouter is
         IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
         if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
 
-        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        _revokeApproval(wrapper, shareAdapter);
+
+        // enforce user slippage protection using the post-dust amount
+        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
+            revert InsufficientAmount(amountReceivedLD, minAmountLD);
+        }
 
         uint256 refund = msg.value - fee.nativeFee;
         if (refund > 0) {
@@ -327,7 +344,8 @@ contract DStockComposerRouter is
         uint256 amountNative,
         uint32 dstEid,
         bytes32 to,
-        bytes calldata extraOptions
+        bytes calldata extraOptions,
+        uint256 minAmountLD
     ) external payable nonReentrant returns (uint256 amountSentLD) {
         if (amountNative == 0) revert AmountZero();
         if (to == bytes32(0)) revert InvalidRecipient();
@@ -355,7 +373,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: amountSentLD,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -365,7 +383,13 @@ contract DStockComposerRouter is
         uint256 availableFee = msg.value - amountNative;
         if (availableFee < fee.nativeFee) revert InsufficientFee(availableFee, fee.nativeFee);
 
-        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        _revokeApproval(wrapper, shareAdapter);
+
+        // enforce user slippage protection using the post-dust amount
+        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
+            revert InsufficientAmount(amountReceivedLD, minAmountLD);
+        }
 
         uint256 refund = availableFee - fee.nativeFee;
         if (refund > 0) {
@@ -398,7 +422,44 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: estimatedNet18,
-            minAmountLD: estimatedNet18,
+            minAmountLD: 0, 
+            extraOptions: extraOptions,
+            composeMsg: "",
+            oftCmd: ""
+        });
+
+        IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
+        return fee.nativeFee;
+    }
+
+    /// @notice Quote the LayerZero fee (native) for user wrap-native + bridge.
+    /// @dev Requires wrapper to implement `previewWrap`.
+    /// @return nativeFee The required native fee for `shareAdapter.send` (amountNative excluded)
+    function quoteWrapAndBridgeNative(
+        uint256 amountNative,
+        uint32 dstEid,
+        bytes32 to,
+        bytes calldata extraOptions
+    ) external view returns (uint256 nativeFee) {
+        if (amountNative == 0) revert AmountZero();
+        if (to == bytes32(0)) revert InvalidRecipient();
+
+        address w = wrappedNative;
+        if (w == address(0)) revert WrappedNativeNotSet();
+
+        address wrapper = underlyingToWrapper[w];
+        address shareAdapter = underlyingToShareAdapter[w];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+        // estimate shares minted by wrapping wrappedNative into wrapper shares
+        (uint256 estimatedNet18, ) = IDStockWrapperPreview(wrapper).previewWrap(w, amountNative);
+        if (estimatedNet18 == 0) revert AmountZero();
+
+        IOFTLike.SendParam memory sp = IOFTLike.SendParam({
+            dstEid: dstEid,
+            to: to,
+            amountLD: estimatedNet18,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -412,10 +473,11 @@ contract DStockComposerRouter is
     ///
     /// Important parameters (LayerZero terminology):
     /// - `_oApp`: the OApp address associated with the compose call.
-    ///   - Forward: `_oApp == underlying` (the token credited to this router)
+    ///   - Forward: `_oApp == underlying oft` (the token credited to this router)
     ///   - Reverse: `_oApp == shareAdapter` (shares adapter credited shares to this router)
     /// - `_guid`: globally unique message id used for idempotency (`processedGuids`)
     /// - `_message`: OFT compose payload, decoded via `OFTComposeMsgCodecLite` to extract `amountLD` and `composeMsg`.
+
     function lzCompose(
         address _oApp,
         bytes32 _guid,
@@ -429,6 +491,9 @@ contract DStockComposerRouter is
         if (processedGuids[_guid]) return;
         processedGuids[_guid] = true;
 
+        // Issue-2 fix: record pre-existing native balance as floor; only refund what this call contributed.
+        _nativeRefundFloor = address(this).balance - msg.value;
+
         // Decode the OFT compose container:
         // - `amountLD`: amount credited to this router before compose executes
         // - `inner`: our router payload (abi-encoded RouteMsg/ReverseRouteMsg)
@@ -440,17 +505,20 @@ contract DStockComposerRouter is
         if (wrapper != address(0)) {
             // Reverse path consumes shares (`amountLD`) and produces underlying.
             _lzComposeReverse(wrapper, _guid, amountLD, inner);
-            return;
+        } else {
+            // Forward: _oApp is the underlying token (OFT token) that was credited to this router
+            address shareAdapter = underlyingToShareAdapter[_oApp];
+            wrapper = underlyingToWrapper[_oApp];
+            if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+            // Forward path consumes underlying (`amountLD`) and produces shares bridged via `shareAdapter`.
+            _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
         }
 
-        // Forward: _oApp is the underlying token (OFT or local ERC20) that was credited to this router
-        address shareAdapter = underlyingToShareAdapter[_oApp];
-        wrapper = underlyingToWrapper[_oApp];
-        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
-
-        // Forward path consumes underlying (`amountLD`) and produces shares bridged via `shareAdapter`.
-        _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
+        // reset floor to current balance to avoid affecting any other code path
+        _nativeRefundFloor = address(this).balance;
     }
+
 
     /// @dev Forward compose path: decode `RouteMsg`, wrap underlying into shares, then send shares.
     function _lzComposeForward(
@@ -505,14 +573,9 @@ contract DStockComposerRouter is
             _refundToken(wrapper, guid, "underlying_zero", r.refundBsc, sharesIn);
             return;
         }
-        if (r.unwrapBps == 0 || r.unwrapBps > 10_000) {
-            // Unwrap fraction is expressed in bps (1..10000).
-            _refundToken(wrapper, guid, "bad_unwrap_bps", r.refundBsc, sharesIn);
-            return;
-        }
 
         // 1) Unwrap shares into underlying.
-        uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc, r.unwrapBps);
+        uint256 underlyingOut = _unwrapShares(wrapper, r.underlying, guid, sharesIn, r.refundBsc);
         if (underlyingOut == 0) return;
 
         if (r.finalDstEid == chainEid) {
@@ -566,7 +629,8 @@ contract DStockComposerRouter is
         _refundNative(r.refundBsc);
     }
 
-    /// @dev Wrap underlying into wrapper shares. On failure, attempts to refund `underlyingAmount` to `refundBsc`.
+    /// @dev Wrap underlying into wrapper shares.
+    /// On failure, attempts to refund only what remains on this router (prevents over-refund).
     function _wrapUnderlying(address wrapper, address underlying, bytes32 guid, uint256 underlyingAmount, address refundBsc)
         internal
         returns (uint256)
@@ -581,14 +645,34 @@ contract DStockComposerRouter is
         // Approve wrapper to pull the underlying for wrapping.
         IERC20(underlying).forceApprove(wrapper, underlyingAmount);
 
+        // Track router underlying balance delta to avoid over-refund on rounding-to-zero shares.
+        uint256 uBefore = balUnderlying;
+
         // Measure shares minted to this router (supports wrappers that don't return exact values).
         uint256 shareBalBefore = IERC20(wrapper).balanceOf(address(this));
         IDStockWrapperLike(wrapper).wrap(underlying, underlyingAmount, address(this));
         uint256 shareBalAfter = IERC20(wrapper).balanceOf(address(this));
         uint256 sharesOut = shareBalAfter - shareBalBefore;
 
+        uint256 uAfter = IERC20(underlying).balanceOf(address(this));
+
+        // optional but good hygiene: revoke approval to wrapper
+        IERC20(underlying).forceApprove(wrapper, 0);
+
         if (sharesOut == 0) {
-            _refundToken(underlying, guid, "wrap_zero_shares", refundBsc, underlyingAmount);
+            // If underlying was NOT consumed, safe to refund requested amount (capped by current balance).
+            if (uAfter >= uBefore) {
+                uint256 refundAmt = uAfter < underlyingAmount ? uAfter : underlyingAmount;
+                if (refundAmt > 0) {
+                    _refundToken(underlying, guid, "wrap_zero_shares", refundBsc, refundAmt);
+                } else {
+                    _fail(guid, "wrap_zero_shares_no_balance", refundBsc, 0);
+                }
+                return 0;
+            }
+
+            // If underlying WAS consumed but shares minted rounded to 0, do NOT refund underlyingAmount.
+            _fail(guid, "wrap_zero_shares_underlying_spent", refundBsc, underlyingAmount);
             return 0;
         }
         return sharesOut;
@@ -609,12 +693,18 @@ contract DStockComposerRouter is
     ) internal returns (bool) {
         uint256 minShares = minAmountLD2 == 0 ? sharesOut : minAmountLD2;
 
+        // Best-effort slippage guard (pre-dust). Compose path should not hard-revert on dust removal.
+        if (minAmountLD2 != 0 && sharesOut < minAmountLD2) {
+            _refundToken(wrapper, guid, "min2_not_met", refundBsc, sharesOut);
+            return false;
+        }
+
         // Second hop: bridge wrapper shares via shareAdapter (OFT adapter).
         IOFTLike.SendParam memory sp = IOFTLike.SendParam({
             dstEid: finalDstEid,
             to: finalTo,
             amountLD: sharesOut,
-            minAmountLD: minShares,
+            minAmountLD: 0, 
             extraOptions: "",
             composeMsg: "",
             oftCmd: ""
@@ -629,9 +719,11 @@ contract DStockComposerRouter is
         IERC20(wrapper).forceApprove(shareAdapter, sharesOut);
 
         try IOFTLike(shareAdapter).send{value: fee2.nativeFee}(sp, fee2, refundBsc) {
+            _revokeApproval(wrapper, shareAdapter);
             emit WrappedAndForwarded(guid, finalDstEid, finalTo, underlyingIn, sharesOut);
             return true;
         } catch {
+            _revokeApproval(wrapper, shareAdapter);
             _refundToken(wrapper, guid, "send2_failed", refundBsc, sharesOut);
             return false;
         }
@@ -647,9 +739,9 @@ contract DStockComposerRouter is
         return abi.decode(inner, (ReverseRouteMsg));
     }
 
-    /// @dev Unwrap `sharesIn * unwrapBps/10000` shares into underlying.
+    /// @dev Unwrap `sharesIn` shares into underlying.
     /// On unwrap failure, refunds the full `sharesIn` (shares token) to `refundBsc`.
-    function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc, uint16 unwrapBps)
+    function _unwrapShares(address wrapper, address underlying, bytes32 guid, uint256 sharesIn, address refundBsc)
         internal
         returns (uint256)
     {
@@ -660,9 +752,8 @@ contract DStockComposerRouter is
             return 0;
         }
 
-        // We may choose to unwrap only a fraction of shares (basis points).
-        uint256 attemptUnderlying = (sharesIn * uint256(unwrapBps)) / 10_000;
-        if (attemptUnderlying == 0) {
+        uint256 sharesToUnwrap = sharesIn;
+        if (sharesToUnwrap == 0) {
             _refundToken(wrapper, guid, "unwrap_zero_amount", refundBsc, sharesIn);
             return 0;
         }
@@ -670,7 +761,7 @@ contract DStockComposerRouter is
         // Track underlying delta to compute actual output.
         uint256 underlyingBalBefore = IERC20(underlying).balanceOf(address(this));
 
-        try IDStockWrapperLike(wrapper).unwrap(underlying, attemptUnderlying, address(this)) {} catch {
+        try IDStockWrapperLike(wrapper).unwrap(underlying, sharesToUnwrap, address(this)) {} catch {
             _refundToken(wrapper, guid, "unwrap_failed", refundBsc, sharesIn);
             return 0;
         }
@@ -753,11 +844,24 @@ contract DStockComposerRouter is
 
     /// @dev Best-effort native refund: sends the contract's entire native balance to `to`.
     /// This is intentionally non-reverting (failure is ignored).
+    /// @dev Best-effort native refund: refunds only the portion attributable to the current `lzCompose` execution.
+    /// This is intentionally non-reverting (failure is ignored).
     function _refundNative(address to) internal {
         if (to == address(0)) return;
         uint256 bal = address(this).balance;
-        if (bal == 0) return;
-        (bool ok, ) = to.call{value: bal}("");
+        uint256 floor = _nativeRefundFloor;
+
+        if (bal <= floor) return;
+        uint256 refundAmt = bal - floor;
+
+        (bool ok, ) = to.call{value: refundAmt}("");
+        ok;
+    }
+
+    /// @dev Used to avoid leaving residual approvals.
+    function _revokeApproval(address token, address spender) internal {
+        // ignore both revert and false return values
+        (bool ok, ) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
         ok;
     }
 
