@@ -164,7 +164,11 @@ contract DStockComposerRouter is
     /// @dev Deployed separately; set via `setWrappedNativePayoutHelper`.
     address public wrappedNativePayoutHelper;
 
-    uint256[43] private __gap;
+    /// @dev Floor for native refunds during `lzCompose` (audit Issue-2).
+    /// Tracks the router's pre-existing native balance to avoid over-refunding.
+    uint256 private _nativeRefundFloor;
+
+    uint256[42] private __gap;
 
     /// @notice Emitted when an underlying forward route is configured.
     event UnderlyingConfigSet(address indexed underlying, address indexed wrapper, address indexed shareAdapter);
@@ -423,6 +427,7 @@ contract DStockComposerRouter is
     ///   - Reverse: `_oApp == shareAdapter` (shares adapter credited shares to this router)
     /// - `_guid`: globally unique message id used for idempotency (`processedGuids`)
     /// - `_message`: OFT compose payload, decoded via `OFTComposeMsgCodecLite` to extract `amountLD` and `composeMsg`.
+
     function lzCompose(
         address _oApp,
         bytes32 _guid,
@@ -436,6 +441,9 @@ contract DStockComposerRouter is
         if (processedGuids[_guid]) return;
         processedGuids[_guid] = true;
 
+        // Issue-2 fix: record pre-existing native balance as floor; only refund what this call contributed.
+        _nativeRefundFloor = address(this).balance - msg.value;
+
         // Decode the OFT compose container:
         // - `amountLD`: amount credited to this router before compose executes
         // - `inner`: our router payload (abi-encoded RouteMsg/ReverseRouteMsg)
@@ -447,17 +455,20 @@ contract DStockComposerRouter is
         if (wrapper != address(0)) {
             // Reverse path consumes shares (`amountLD`) and produces underlying.
             _lzComposeReverse(wrapper, _guid, amountLD, inner);
-            return;
+        } else {
+            // Forward: _oApp is the underlying token (OFT token) that was credited to this router
+            address shareAdapter = underlyingToShareAdapter[_oApp];
+            wrapper = underlyingToWrapper[_oApp];
+            if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+            // Forward path consumes underlying (`amountLD`) and produces shares bridged via `shareAdapter`.
+            _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
         }
 
-        // Forward: _oApp is the underlying token (OFT token) that was credited to this router
-        address shareAdapter = underlyingToShareAdapter[_oApp];
-        wrapper = underlyingToWrapper[_oApp];
-        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
-
-        // Forward path consumes underlying (`amountLD`) and produces shares bridged via `shareAdapter`.
-        _lzComposeForward(_oApp, wrapper, shareAdapter, _guid, amountLD, inner);
+        // reset floor to current balance to avoid affecting any other code path
+        _nativeRefundFloor = address(this).balance;
     }
+
 
     /// @dev Forward compose path: decode `RouteMsg`, wrap underlying into shares, then send shares.
     function _lzComposeForward(
@@ -777,11 +788,17 @@ contract DStockComposerRouter is
 
     /// @dev Best-effort native refund: sends the contract's entire native balance to `to`.
     /// This is intentionally non-reverting (failure is ignored).
+    /// @dev Best-effort native refund: refunds only the portion attributable to the current `lzCompose` execution.
+    /// This is intentionally non-reverting (failure is ignored).
     function _refundNative(address to) internal {
         if (to == address(0)) return;
         uint256 bal = address(this).balance;
-        if (bal == 0) return;
-        (bool ok, ) = to.call{value: bal}("");
+        uint256 floor = _nativeRefundFloor;
+
+        if (bal <= floor) return;
+        uint256 refundAmt = bal - floor;
+
+        (bool ok, ) = to.call{value: refundAmt}("");
         ok;
     }
 

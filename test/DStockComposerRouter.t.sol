@@ -492,6 +492,58 @@ contract DStockComposerRouterTest is Test {
         assertEq(REFUND.balance, preRefund + 0.4 ether);
     }
 
+    function test_lzCompose_forward_refundNative_doesNotOverRefundPreexistingBalance() public {
+        uint256 amountUnderlying = 10e6;
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        // router has pre-existing native; should NOT be refunded
+        vm.deal(address(router), 1 ether);
+
+        shareAdapter.setFee(0.1 ether);
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidRefundFloor1"), amountUnderlying, abi.encode(r));
+
+        vm.deal(ENDPOINT, 1 ether);
+        uint256 preRefund = REFUND.balance;
+        uint256 preRouter = address(router).balance;
+
+        vm.prank(ENDPOINT);
+        router.lzCompose{value: 0.5 ether}(address(underlyingOft), bytes32("guidRefundFloor1"), message, address(0), "");
+
+        // only msg.value leftovers are refunded: 0.5 - 0.1 = 0.4
+        assertEq(REFUND.balance, preRefund + 0.4 ether);
+        // router retains its pre-existing native balance
+        assertEq(address(router).balance, preRouter);
+    }
+
+    function test_lzCompose_forward_refundNative_whenFeeExceedsMsgValue_refundsZero() public {
+        uint256 amountUnderlying = 10e6;
+        underlyingOft.mint(address(router), amountUnderlying);
+
+        // router has pre-existing native; it will subsidize the fee
+        vm.deal(address(router), 1 ether);
+
+        // fee > msg.value
+        shareAdapter.setFee(0.2 ether);
+
+        DStockComposerRouter.RouteMsg memory r =
+            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        (, bytes memory message) = _compose(bytes32("guidRefundFloor2"), amountUnderlying, abi.encode(r));
+
+        vm.deal(ENDPOINT, 1 ether);
+        uint256 preRefund = REFUND.balance;
+
+        vm.prank(ENDPOINT);
+        router.lzCompose{value: 0.1 ether}(address(underlyingOft), bytes32("guidRefundFloor2"), message, address(0), "");
+
+        // msg.value fully consumed and router subsidized, so refund must be 0
+        assertEq(REFUND.balance, preRefund);
+        // router paid 0.1 from its own balance (0.2 fee - 0.1 msg.value)
+        assertEq(address(router).balance, 0.9 ether);
+    }
+
     function test_lzCompose_forward_success() public {
         uint256 amountUnderlying = 1000e6;
         uint256 expectedShares = amountUnderlying * 1e12; // 6 -> 18
