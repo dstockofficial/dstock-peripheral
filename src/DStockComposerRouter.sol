@@ -307,7 +307,6 @@ contract DStockComposerRouter is
         (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(underlying, amount, address(this));
         amountSentLD = net18;
         if (amountSentLD == 0) revert AmountZero();
-        if (amountSentLD < minAmountLD) revert InsufficientAmount(amountSentLD, minAmountLD);
 
         IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
 
@@ -315,7 +314,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: minAmountLD,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -324,8 +323,13 @@ contract DStockComposerRouter is
         IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
         if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
 
-        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
         _revokeApproval(wrapper, shareAdapter);
+
+        // enforce user slippage protection using the post-dust amount
+        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
+            revert InsufficientAmount(amountReceivedLD, minAmountLD);
+        }
 
         uint256 refund = msg.value - fee.nativeFee;
         if (refund > 0) {
@@ -362,7 +366,6 @@ contract DStockComposerRouter is
         (uint256 net18, ) = IDStockWrapperLike(wrapper).wrap(w, amountNative, address(this));
         amountSentLD = net18;
         if (amountSentLD == 0) revert AmountZero();
-        if (amountSentLD < minAmountLD) revert InsufficientAmount(amountSentLD, minAmountLD);
 
         IERC20(wrapper).forceApprove(shareAdapter, amountSentLD);
 
@@ -370,7 +373,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: amountSentLD,
-            minAmountLD: minAmountLD,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -380,8 +383,13 @@ contract DStockComposerRouter is
         uint256 availableFee = msg.value - amountNative;
         if (availableFee < fee.nativeFee) revert InsufficientFee(availableFee, fee.nativeFee);
 
-        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
         _revokeApproval(wrapper, shareAdapter);
+
+        // enforce user slippage protection using the post-dust amount
+        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
+            revert InsufficientAmount(amountReceivedLD, minAmountLD);
+        }
 
         uint256 refund = availableFee - fee.nativeFee;
         if (refund > 0) {
@@ -414,7 +422,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: estimatedNet18,
-            minAmountLD: estimatedNet18,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -451,7 +459,7 @@ contract DStockComposerRouter is
             dstEid: dstEid,
             to: to,
             amountLD: estimatedNet18,
-            minAmountLD: estimatedNet18,
+            minAmountLD: 0, 
             extraOptions: extraOptions,
             composeMsg: "",
             oftCmd: ""
@@ -685,12 +693,18 @@ contract DStockComposerRouter is
     ) internal returns (bool) {
         uint256 minShares = minAmountLD2 == 0 ? sharesOut : minAmountLD2;
 
+        // Best-effort slippage guard (pre-dust). Compose path should not hard-revert on dust removal.
+        if (minAmountLD2 != 0 && sharesOut < minAmountLD2) {
+            _refundToken(wrapper, guid, "min2_not_met", refundBsc, sharesOut);
+            return false;
+        }
+
         // Second hop: bridge wrapper shares via shareAdapter (OFT adapter).
         IOFTLike.SendParam memory sp = IOFTLike.SendParam({
             dstEid: finalDstEid,
             to: finalTo,
             amountLD: sharesOut,
-            minAmountLD: minShares,
+            minAmountLD: 0, 
             extraOptions: "",
             composeMsg: "",
             oftCmd: ""
