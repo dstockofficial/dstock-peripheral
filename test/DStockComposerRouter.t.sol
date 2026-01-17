@@ -388,6 +388,17 @@ contract DStockComposerRouterTest is Test {
         router.quoteWrapAndBridge(address(u), 1e6, 30367, bytes32(uint256(1)), "");
     }
 
+    function test_quoteWrapAndBridgeNative_matchesFee() public {
+        shareAdapter.setFee(0.123 ether);
+        uint256 fee = router.quoteWrapAndBridgeNative(
+            1 ether,
+            30367,
+            bytes32(uint256(uint160(address(0xB0B)))),
+            ""
+        );
+        assertEq(fee, 0.123 ether);
+    }
+
     function test_lzCompose_revertIfNotEndpoint() public {
         vm.expectRevert(DStockComposerRouter.NotEndpoint.selector);
         router.lzCompose(address(underlyingOft), bytes32("guidNE"), "", address(0), "");

@@ -230,7 +230,7 @@ contract DStockComposerRouter is
     constructor() {
         _disableInitializers();
     }
-    
+
     /// @notice UUPS initializer (called once via proxy).
     /// @param _endpoint LayerZero EndpointV2 address on this chain
     /// @param _chainEid LayerZero EID for this chain
@@ -408,6 +408,43 @@ contract DStockComposerRouter is
         if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
 
         (uint256 estimatedNet18, ) = IDStockWrapperPreview(wrapper).previewWrap(underlying, amount);
+        if (estimatedNet18 == 0) revert AmountZero();
+
+        IOFTLike.SendParam memory sp = IOFTLike.SendParam({
+            dstEid: dstEid,
+            to: to,
+            amountLD: estimatedNet18,
+            minAmountLD: estimatedNet18,
+            extraOptions: extraOptions,
+            composeMsg: "",
+            oftCmd: ""
+        });
+
+        IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
+        return fee.nativeFee;
+    }
+
+    /// @notice Quote the LayerZero fee (native) for user wrap-native + bridge.
+    /// @dev Requires wrapper to implement `previewWrap`.
+    /// @return nativeFee The required native fee for `shareAdapter.send` (amountNative excluded)
+    function quoteWrapAndBridgeNative(
+        uint256 amountNative,
+        uint32 dstEid,
+        bytes32 to,
+        bytes calldata extraOptions
+    ) external view returns (uint256 nativeFee) {
+        if (amountNative == 0) revert AmountZero();
+        if (to == bytes32(0)) revert InvalidRecipient();
+
+        address w = wrappedNative;
+        if (w == address(0)) revert WrappedNativeNotSet();
+
+        address wrapper = underlyingToWrapper[w];
+        address shareAdapter = underlyingToShareAdapter[w];
+        if (wrapper == address(0) || shareAdapter == address(0)) revert InvalidOApp();
+
+        // estimate shares minted by wrapping wrappedNative into wrapper shares
+        (uint256 estimatedNet18, ) = IDStockWrapperPreview(wrapper).previewWrap(w, amountNative);
         if (estimatedNet18 == 0) revert AmountZero();
 
         IOFTLike.SendParam memory sp = IOFTLike.SendParam({

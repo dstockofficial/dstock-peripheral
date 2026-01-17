@@ -25,6 +25,7 @@ This repository contains contracts that enable:
 - **User entry (EOA calls)**:
   - `wrapAndBridge(underlying, amount, dstEid, to, extraOptions, minAmountLD)`
   - `quoteWrapAndBridge(underlying, amount, dstEid, to, extraOptions)`
+  - `quoteWrapAndBridgeNative(amountNative, dstEid, to, extraOptions)`
 
 - **Compose entry (LayerZero Endpoint calls)**:
   - `lzCompose(_oApp, _guid, _message, ...)`
