@@ -323,13 +323,15 @@ contract DStockComposerRouter is
         IOFTLike.MessagingFee memory fee = IOFTLike(shareAdapter).quoteSend(sp, false);
         if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
 
-        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        uint256 balBefore = IERC20(wrapper).balanceOf(address(this));
+        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        uint256 balAfter = IERC20(wrapper).balanceOf(address(this));
         _revokeApproval(wrapper, shareAdapter);
 
-        // enforce user slippage protection using the post-dust amount
-        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
-            revert InsufficientAmount(amountReceivedLD, minAmountLD);
-        }
+        // Use balance delta (actual debited amount) for slippage checks to avoid trusting
+        // potentially inflated adapter-reported values for share-based / rebasing wrappers.
+        uint256 actualDebitedLD = balBefore > balAfter ? (balBefore - balAfter) : 0;
+        if (minAmountLD != 0 && actualDebitedLD < minAmountLD) revert InsufficientAmount(actualDebitedLD, minAmountLD);
 
         uint256 refund = msg.value - fee.nativeFee;
         if (refund > 0) {
@@ -383,13 +385,13 @@ contract DStockComposerRouter is
         uint256 availableFee = msg.value - amountNative;
         if (availableFee < fee.nativeFee) revert InsufficientFee(availableFee, fee.nativeFee);
 
-        (, , , , uint256 amountReceivedLD) = IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        uint256 balBefore = IERC20(wrapper).balanceOf(address(this));
+        IOFTLike(shareAdapter).send{value: fee.nativeFee}(sp, fee, msg.sender);
+        uint256 balAfter = IERC20(wrapper).balanceOf(address(this));
         _revokeApproval(wrapper, shareAdapter);
 
-        // enforce user slippage protection using the post-dust amount
-        if (minAmountLD != 0 && amountReceivedLD < minAmountLD) {
-            revert InsufficientAmount(amountReceivedLD, minAmountLD);
-        }
+        uint256 actualDebitedLD = balBefore > balAfter ? (balBefore - balAfter) : 0;
+        if (minAmountLD != 0 && actualDebitedLD < minAmountLD) revert InsufficientAmount(actualDebitedLD, minAmountLD);
 
         uint256 refund = availableFee - fee.nativeFee;
         if (refund > 0) {
