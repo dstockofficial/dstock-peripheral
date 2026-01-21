@@ -16,7 +16,7 @@ import {WrappedNativePayoutHelperV2} from "../src/WrappedNativePayoutHelper.sol"
 ///   - ADMIN_PK
 ///   - ENDPOINT_ADDRESS
 ///   - CHAIN_EID
-///   - OWNER_ADDRESS
+///   - OWNER_ADDRESS (initial ADMIN_ROLE address)
 /// - Optional (initial route config):
 ///   - WRAPPER_ADDRESS
 ///   - SHARE_ADAPTER_ADDRESS

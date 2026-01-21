@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -118,7 +118,7 @@ interface IOAppComposer {
 ///   - deliver locally if `finalDstEid == chainEid`, or
 ///   - bridge underlying via the `underlying` OFT token.
 ///
-/// ### Registries (owner configured)
+/// ### Registries (admin configured)
 /// - `underlyingToWrapper[underlying] = wrapper`
 /// - `underlyingToShareAdapter[underlying] = shareAdapter`
 /// - `shareAdapterToWrapper[shareAdapter] = wrapper` (used to identify reverse compose)
@@ -131,12 +131,16 @@ interface IOAppComposer {
 contract DStockComposerRouterV2 is
     Initializable,
     UUPSUpgradeable,
-    OwnableUpgradeable,
+    AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
     IOAppComposer
 {
     using OFTComposeMsgCodecLite for bytes;
     using SafeERC20 for IERC20;
+
+    /// @notice Admin role for privileged router operations (routes, wrapped native config, rescues, upgrades).
+    /// @dev Self-administered: an ADMIN can grant/revoke ADMIN to/from others to rotate privileges.
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     /// @notice LayerZero EndpointV2 address on this chain.
     address public endpoint;
@@ -158,7 +162,7 @@ contract DStockComposerRouterV2 is
     mapping(bytes32 => bool) public processedGuids;
 
     /// @notice Wrapped native token (e.g., WBNB/WETH) used by `wrapAndBridgeNative`.
-    /// @dev Owner must configure this and register a route via `setRouteConfig(wrappedNative, wrapper, shareAdapter)`.
+    /// @dev Admin must configure this and register a route via `setRouteConfig(wrappedNative, wrapper, shareAdapter)`.
     address public wrappedNative;
     /// @notice Helper used to unwrap wrappedNative and pay native to receiver on reverse local delivery.
     /// @dev Deployed separately; set via `setWrappedNativePayoutHelper`.
@@ -234,18 +238,21 @@ contract DStockComposerRouterV2 is
     /// @notice UUPS initializer (called once via proxy).
     /// @param _endpoint LayerZero EndpointV2 address on this chain
     /// @param _chainEid LayerZero EID for this chain
-    /// @param _owner Owner/admin that can configure routes and upgrade
-    function initialize(address _endpoint, uint32 _chainEid, address _owner) external initializer {
-        if (_endpoint == address(0) || _owner == address(0)) revert ZeroAddress();
-        __Ownable_init(_owner);
+    /// @param _admin Admin that can configure routes and upgrade
+    function initialize(address _endpoint, uint32 _chainEid, address _admin) external initializer {
+        if (_endpoint == address(0) || _admin == address(0)) revert ZeroAddress();
+        __AccessControl_init();
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
         endpoint = _endpoint;
         chainEid = _chainEid;
+
+        _setRoleAdmin(ADMIN_ROLE, ADMIN_ROLE);
+        _grantRole(ADMIN_ROLE, _admin);
     }
 
-    function _authorizeUpgrade(address) internal override onlyOwner {}
+    function _authorizeUpgrade(address) internal override onlyRole(ADMIN_ROLE) {}
 
 
     /// @notice Configure routing for one wrapper/shareAdapter pair (and optionally one underlying).
@@ -253,7 +260,7 @@ contract DStockComposerRouterV2 is
     /// If `underlying != address(0)`, also registers forward mappings `underlying -> (wrapper, shareAdapter)`.
     ///
     /// This function can be called multiple times to register multiple underlyings that share the same wrapper/shareAdapter.
-    function setRouteConfig(address underlying, address wrapper, address shareAdapter) public onlyOwner {
+    function setRouteConfig(address underlying, address wrapper, address shareAdapter) public onlyRole(ADMIN_ROLE) {
         if (wrapper == address(0) || shareAdapter == address(0)) revert ZeroAddress();
 
         shareAdapterToWrapper[shareAdapter] = wrapper;
@@ -267,14 +274,14 @@ contract DStockComposerRouterV2 is
     }
 
     /// @notice Configure wrapped native token (e.g., WBNB/WETH) for `wrapAndBridgeNative`.
-    function setWrappedNative(address wrappedNative_) external onlyOwner {
+    function setWrappedNative(address wrappedNative_) external onlyRole(ADMIN_ROLE) {
         if (wrappedNative_ == address(0)) revert ZeroAddress();
         wrappedNative = wrappedNative_;
     }
 
     /// @notice Configure the helper used for reverse local native delivery (WBNB/WETH -> native payout).
     /// @dev This helper must be deployed as a standalone contract (see `src/WrappedNativePayoutHelper.sol`).
-    function setWrappedNativePayoutHelper(address helper) external onlyOwner {
+    function setWrappedNativePayoutHelper(address helper) external onlyRole(ADMIN_ROLE) {
         if (helper == address(0)) revert ZeroAddress();
         wrappedNativePayoutHelper = helper;
     }
@@ -816,12 +823,12 @@ contract DStockComposerRouterV2 is
     }
     /// @notice Rescue ERC20 tokens from this contract (admin only).
     /// @dev Intended for edge cases where a refund failed and funds are stuck.
-    function rescueToken(address token, address to, uint256 amount) external onlyOwner {
+    function rescueToken(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
         IERC20(token).safeTransfer(to, amount);
     }
 
     /// @notice Rescue native gas token from this contract (admin only).
-    function rescueNative(address to, uint256 amount) external onlyOwner {
+    function rescueNative(address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
         (bool ok, ) = to.call{value: amount}("");
         require(ok, "native_rescue_failed");
     }
