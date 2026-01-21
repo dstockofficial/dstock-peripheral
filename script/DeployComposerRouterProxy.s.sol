@@ -6,10 +6,10 @@ import "forge-std/console2.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
-import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
-import {WrappedNativePayoutHelper} from "../src/WrappedNativePayoutHelper.sol";
+import {DStockComposerRouterV2} from "../src/DStockComposerRouter.sol";
+import {WrappedNativePayoutHelperV2} from "../src/WrappedNativePayoutHelper.sol";
 
-/// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouter and optionally registers routes.
+/// @notice Deploys the UUPS implementation + ERC1967Proxy for DStockComposerRouterV2 and optionally registers routes.
 ///
 /// Env vars:
 /// - Required:
@@ -44,15 +44,15 @@ contract DeployComposerRouterProxy is Script {
         vm.startBroadcast(adminPk);
 
         // 1) deploy implementation
-        DStockComposerRouter impl = new DStockComposerRouter();
+        DStockComposerRouterV2 impl = new DStockComposerRouterV2();
 
         // 2) deploy proxy + initialize
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (endpoint, chainEid, owner));
+        bytes memory initData = abi.encodeCall(DStockComposerRouterV2.initialize, (endpoint, chainEid, owner));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
 
         // 3) optional: configure routes / wrapped native
         if (wrapper != address(0) && shareAdapter != address(0)) {
-            DStockComposerRouter router = DStockComposerRouter(payable(address(proxy)));
+            DStockComposerRouterV2 router = DStockComposerRouterV2(payable(address(proxy)));
 
             // Always register reverse mapping (shareAdapter -> wrapper).
             // If no underlying is provided, this still enables reverse compose routing.
@@ -79,7 +79,7 @@ contract DeployComposerRouterProxy is Script {
 
                 // If helper isn't provided, deploy one now.
                 if (wrappedNativeHelper == address(0)) {
-                    WrappedNativePayoutHelper helper = new WrappedNativePayoutHelper(address(proxy));
+                    WrappedNativePayoutHelperV2 helper = new WrappedNativePayoutHelperV2(address(proxy));
                     wrappedNativeHelper = address(helper);
                 }
                 router.setWrappedNativePayoutHelper(wrappedNativeHelper);

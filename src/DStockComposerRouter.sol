@@ -9,7 +9,7 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {WrappedNativePayoutHelper} from "./WrappedNativePayoutHelper.sol";
+import {WrappedNativePayoutHelperV2} from "./WrappedNativePayoutHelper.sol";
 
 /// @dev Minimal LayerZero OFT compose message decoder used by `lzCompose`.
 ///
@@ -128,7 +128,7 @@ interface IOAppComposer {
 /// - **Compose failure handling**: most compose-path failures do **not** revert; the router emits `RouteFailed` and
 ///   attempts to refund tokens / native fee to `refundBsc` (best effort).
 /// - **Hard reverts**: `lzCompose` still reverts for `NotEndpoint` and for unknown `_oApp` (`InvalidOApp`).
-contract DStockComposerRouter is
+contract DStockComposerRouterV2 is
     Initializable,
     UUPSUpgradeable,
     OwnableUpgradeable,
@@ -604,7 +604,7 @@ contract DStockComposerRouter is
 
                 // Move wrapped tokens to helper, then helper unwraps and delivers native.
                 IERC20(r.underlying).safeTransfer(helper, underlyingOut);
-                bool okNative = WrappedNativePayoutHelper(payable(helper)).unwrapAndPayout(wrappedNative, receiver, r.refundBsc, underlyingOut);
+                bool okNative = WrappedNativePayoutHelperV2(payable(helper)).unwrapAndPayout(wrappedNative, receiver, r.refundBsc, underlyingOut);
                 if (!okNative) {
                     // helper already refunded wrapped/native best-effort to refundBsc
                     emit RouteFailed(guid, "deliver_native_failed", r.refundBsc, underlyingOut);

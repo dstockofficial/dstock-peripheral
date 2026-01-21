@@ -10,7 +10,7 @@ interface IWrappedNativeLike {
 }
 
 /**
- * @title WrappedNativePayoutHelper
+ * @title WrappedNativePayoutHelperV2
  * @notice Helper contract for delivering native gas token (BNB/ETH) when the router's reverse path unwraps into WBNB/WETH.
  *
  * @dev Why this helper exists:
@@ -28,7 +28,7 @@ interface IWrappedNativeLike {
  *
  * The helper is stateless and permissionless; router should store its address and call it as needed.
  */
-contract WrappedNativePayoutHelper {
+contract WrappedNativePayoutHelperV2 {
     error NotRouter();
     error ZeroRouter();
 
