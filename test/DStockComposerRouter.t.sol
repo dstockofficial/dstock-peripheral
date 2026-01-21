@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
-import {DStockComposerRouter} from "../src/DStockComposerRouter.sol";
+import {DStockComposerRouterV2} from "../src/DStockComposerRouter.sol";
 import {MockOFTLikeToken} from "./mocks/MockOFTLikeToken.sol";
 import {MockOFTLikeAdapter} from "./mocks/MockOFTLikeAdapter.sol";
 import {MockOFTLikeAdapterRevertSend} from "./mocks/MockOFTLikeAdapterRevertSend.sol";
@@ -16,7 +16,7 @@ import {MockComposerWrapperNoOpUnwrap} from "./mocks/MockComposerWrapperNoOpUnwr
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockERC20Blocklist} from "./mocks/MockERC20Blocklist.sol";
 import {MockWETH9} from "./mocks/MockWETH9.sol";
-import {WrappedNativePayoutHelper} from "../src/WrappedNativePayoutHelper.sol";
+import {WrappedNativePayoutHelperV2} from "../src/WrappedNativePayoutHelper.sol";
 
 contract RejectEther {
     receive() external payable {
@@ -29,8 +29,8 @@ contract DStockComposerRouterTest is Test {
     address internal constant REFUND = address(0xBEEF);
     uint32 internal constant CHAIN_EID = 12345;
 
-    DStockComposerRouter internal router;
-    DStockComposerRouter internal impl;
+    DStockComposerRouterV2 internal router;
+    DStockComposerRouterV2 internal impl;
 
     MockOFTLikeToken internal underlyingOft;
     MockComposerWrapper internal wrapper;
@@ -43,10 +43,10 @@ contract DStockComposerRouterTest is Test {
 
     function setUp() public {
         // deploy implementation + proxy and initialize
-        impl = new DStockComposerRouter();
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(this)));
+        impl = new DStockComposerRouterV2();
+        bytes memory initData = abi.encodeCall(DStockComposerRouterV2.initialize, (ENDPOINT, CHAIN_EID, address(this)));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
-        router = DStockComposerRouter(payable(address(proxy)));
+        router = DStockComposerRouterV2(payable(address(proxy)));
 
         // build one asset config
         underlyingOft = new MockOFTLikeToken("UnderlyingOFT", "uOFT", 6);
@@ -64,7 +64,7 @@ contract DStockComposerRouterTest is Test {
         wnative = new MockWETH9();
         wrapper.setUnderlyingDecimals(address(wnative), 18);
         router.setWrappedNative(address(wnative));
-        router.setWrappedNativePayoutHelper(address(new WrappedNativePayoutHelper(address(router))));
+        router.setWrappedNativePayoutHelper(address(new WrappedNativePayoutHelperV2(address(router))));
         router.setRouteConfig(address(wnative), address(wrapper), address(shareAdapter));
     }
 
@@ -82,14 +82,14 @@ contract DStockComposerRouterTest is Test {
         // After Recommendation-1 we disable initializers on the implementation contract.
         // Therefore `initialize(...)` MUST be invoked via proxy to test ZeroAddress validation.
 
-        DStockComposerRouter i = new DStockComposerRouter();
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (address(0), CHAIN_EID, address(this)));
-        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        DStockComposerRouterV2 i = new DStockComposerRouterV2();
+        bytes memory initData = abi.encodeCall(DStockComposerRouterV2.initialize, (address(0), CHAIN_EID, address(this)));
+        vm.expectRevert(DStockComposerRouterV2.ZeroAddress.selector);
         new ERC1967Proxy(address(i), initData);
 
-        i = new DStockComposerRouter();
-        initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(0)));
-        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        i = new DStockComposerRouterV2();
+        initData = abi.encodeCall(DStockComposerRouterV2.initialize, (ENDPOINT, CHAIN_EID, address(0)));
+        vm.expectRevert(DStockComposerRouterV2.ZeroAddress.selector);
         new ERC1967Proxy(address(i), initData);
     }
 
@@ -106,10 +106,10 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_setRouteConfig_revertIfZeroWrapperOrAdapter() public {
-        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        vm.expectRevert(DStockComposerRouterV2.ZeroAddress.selector);
         router.setRouteConfig(address(underlyingOft), address(0), address(shareAdapter));
 
-        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        vm.expectRevert(DStockComposerRouterV2.ZeroAddress.selector);
         router.setRouteConfig(address(underlyingOft), address(wrapper), address(0));
     }
 
@@ -174,18 +174,18 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_setWrappedNative_revertIfZero() public {
-        vm.expectRevert(DStockComposerRouter.ZeroAddress.selector);
+        vm.expectRevert(DStockComposerRouterV2.ZeroAddress.selector);
         router.setWrappedNative(address(0));
     }
 
     function test_wrapAndBridgeNative_revertIfWrappedNativeNotSet() public {
         // fresh router without wrappedNative configured
-        DStockComposerRouter i = new DStockComposerRouter();
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(this)));
+        DStockComposerRouterV2 i = new DStockComposerRouterV2();
+        bytes memory initData = abi.encodeCall(DStockComposerRouterV2.initialize, (ENDPOINT, CHAIN_EID, address(this)));
         ERC1967Proxy proxy = new ERC1967Proxy(address(i), initData);
-        DStockComposerRouter r2 = DStockComposerRouter(payable(address(proxy)));
+        DStockComposerRouterV2 r2 = DStockComposerRouterV2(payable(address(proxy)));
 
-        vm.expectRevert(DStockComposerRouter.WrappedNativeNotSet.selector);
+        vm.expectRevert(DStockComposerRouterV2.WrappedNativeNotSet.selector);
         r2.wrapAndBridgeNative{value: 1}(1, 30367, bytes32(uint256(1)), "", 0);
     }
 
@@ -213,7 +213,7 @@ contract DStockComposerRouterTest is Test {
         vm.deal(user, 1 ether);
 
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.5 ether, 1 ether));
+        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouterV2.InsufficientFee.selector, 0.5 ether, 1 ether));
         router.wrapAndBridgeNative{value: 0.5 ether}(1 ether, 30367, bytes32(uint256(1)), "", 0);
     }
 
@@ -224,21 +224,21 @@ contract DStockComposerRouterTest is Test {
 
         vm.deal(user, 2 ether);
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.05 ether, 0.2 ether));
+        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouterV2.InsufficientFee.selector, 0.05 ether, 0.2 ether));
         router.wrapAndBridgeNative{value: 1.05 ether}(amountNative, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridgeNative_revertIfInvalidOAppConfig() public {
         // fresh router: wrappedNative set, but no setRouteConfig for it
-        DStockComposerRouter i = new DStockComposerRouter();
-        bytes memory initData = abi.encodeCall(DStockComposerRouter.initialize, (ENDPOINT, CHAIN_EID, address(this)));
+        DStockComposerRouterV2 i = new DStockComposerRouterV2();
+        bytes memory initData = abi.encodeCall(DStockComposerRouterV2.initialize, (ENDPOINT, CHAIN_EID, address(this)));
         ERC1967Proxy proxy = new ERC1967Proxy(address(i), initData);
-        DStockComposerRouter r2 = DStockComposerRouter(payable(address(proxy)));
+        DStockComposerRouterV2 r2 = DStockComposerRouterV2(payable(address(proxy)));
 
         MockWETH9 w2 = new MockWETH9();
         r2.setWrappedNative(address(w2));
 
-        vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
+        vm.expectRevert(DStockComposerRouterV2.InvalidOApp.selector);
         r2.wrapAndBridgeNative{value: 1 ether}(1 ether, 30367, bytes32(uint256(1)), "", 0);
     }
 
@@ -255,7 +255,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(wnative),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
@@ -289,7 +289,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(wnative),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
@@ -310,17 +310,17 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_wrapAndBridge_revertIfInvalidUnderlyingConfig() public {
-        vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
+        vm.expectRevert(DStockComposerRouterV2.InvalidOApp.selector);
         router.wrapAndBridge(address(0xBADD), 1, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridge_revertIfAmountZero() public {
-        vm.expectRevert(DStockComposerRouter.AmountZero.selector);
+        vm.expectRevert(DStockComposerRouterV2.AmountZero.selector);
         router.wrapAndBridge(address(localUnderlying), 0, 30367, bytes32(uint256(1)), "", 0);
     }
 
     function test_wrapAndBridge_revertIfInvalidRecipient() public {
-        vm.expectRevert(DStockComposerRouter.InvalidRecipient.selector);
+        vm.expectRevert(DStockComposerRouterV2.InvalidRecipient.selector);
         router.wrapAndBridge(address(localUnderlying), 1, 30367, bytes32(0), "", 0);
     }
 
@@ -334,7 +334,7 @@ contract DStockComposerRouterTest is Test {
 
         vm.startPrank(user);
         localUnderlying.approve(address(router), amount);
-        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouter.InsufficientFee.selector, 0.5 ether, 1 ether));
+        vm.expectRevert(abi.encodeWithSelector(DStockComposerRouterV2.InsufficientFee.selector, 0.5 ether, 1 ether));
         router.wrapAndBridge{value: 0.5 ether}(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "", 0);
         vm.stopPrank();
     }
@@ -351,7 +351,7 @@ contract DStockComposerRouterTest is Test {
         vm.startPrank(user);
         localUnderlying.approve(address(router), amount);
         vm.expectRevert(
-            abi.encodeWithSelector(DStockComposerRouter.InsufficientAmount.selector, expectedSentLD, expectedSentLD + 1)
+            abi.encodeWithSelector(DStockComposerRouterV2.InsufficientAmount.selector, expectedSentLD, expectedSentLD + 1)
         );
         router.wrapAndBridge(address(localUnderlying), amount, 30367, bytes32(uint256(uint160(user))), "", expectedSentLD + 1);
         vm.stopPrank();
@@ -370,12 +370,12 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_quoteWrapAndBridge_revertIfAmountZero() public {
-        vm.expectRevert(DStockComposerRouter.AmountZero.selector);
+        vm.expectRevert(DStockComposerRouterV2.AmountZero.selector);
         router.quoteWrapAndBridge(address(localUnderlying), 0, 30367, bytes32(uint256(1)), "");
     }
 
     function test_quoteWrapAndBridge_revertIfInvalidRecipient() public {
-        vm.expectRevert(DStockComposerRouter.InvalidRecipient.selector);
+        vm.expectRevert(DStockComposerRouterV2.InvalidRecipient.selector);
         router.quoteWrapAndBridge(address(localUnderlying), 1, 30367, bytes32(0), "");
     }
 
@@ -384,7 +384,7 @@ contract DStockComposerRouterTest is Test {
         MockERC20 u = new MockERC20("U", "U", 6);
         router.setRouteConfig(address(u), address(wrapper), address(shareAdapter));
 
-        vm.expectRevert(DStockComposerRouter.AmountZero.selector);
+        vm.expectRevert(DStockComposerRouterV2.AmountZero.selector);
         router.quoteWrapAndBridge(address(u), 1e6, 30367, bytes32(uint256(1)), "");
     }
 
@@ -400,17 +400,17 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_lzCompose_revertIfNotEndpoint() public {
-        vm.expectRevert(DStockComposerRouter.NotEndpoint.selector);
+        vm.expectRevert(DStockComposerRouterV2.NotEndpoint.selector);
         router.lzCompose(address(underlyingOft), bytes32("guidNE"), "", address(0), "");
     }
 
     function test_lzCompose_revertIfInvalidOApp() public {
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidBad"), 1, abi.encode(r));
 
         vm.prank(ENDPOINT);
-        vm.expectRevert(DStockComposerRouter.InvalidOApp.selector);
+        vm.expectRevert(DStockComposerRouterV2.InvalidOApp.selector);
         router.lzCompose(address(0xBADD), bytes32("guidBad"), message, address(0), "");
     }
 
@@ -431,8 +431,8 @@ contract DStockComposerRouterTest is Test {
         uint256 amountUnderlying = 100e6;
         underlyingOft.mint(address(router), amountUnderlying);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: address(0), minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: address(0), minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidRefund0Fwd"), amountUnderlying, abi.encode(r));
 
         vm.expectEmit(true, true, true, true);
@@ -452,8 +452,8 @@ contract DStockComposerRouterTest is Test {
         underlyingOft.mint(address(router), amountUnderlying);
         shareAdapter.setFee(1 ether); // router has 0 ether => fee insufficient
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidFeeFwd"), amountUnderlying, abi.encode(r));
 
         vm.prank(ENDPOINT);
@@ -476,8 +476,8 @@ contract DStockComposerRouterTest is Test {
         badAdapter.setRevertOnSend(true);
         router.setRouteConfig(address(underlyingOft), address(wrapper), address(badAdapter));
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidSendFailFwd"), amountUnderlying, abi.encode(r));
 
         vm.prank(ENDPOINT);
@@ -494,8 +494,8 @@ contract DStockComposerRouterTest is Test {
 
         shareAdapter.setFee(0.1 ether);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidRefundNativeFwd"), amountUnderlying, abi.encode(r));
 
         vm.deal(ENDPOINT, 1 ether);
@@ -517,8 +517,8 @@ contract DStockComposerRouterTest is Test {
 
         shareAdapter.setFee(0.1 ether);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidRefundFloor1"), amountUnderlying, abi.encode(r));
 
         vm.deal(ENDPOINT, 1 ether);
@@ -544,8 +544,8 @@ contract DStockComposerRouterTest is Test {
         // fee > msg.value
         shareAdapter.setFee(0.2 ether);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidRefundFloor2"), amountUnderlying, abi.encode(r));
 
         vm.deal(ENDPOINT, 1 ether);
@@ -571,8 +571,8 @@ contract DStockComposerRouterTest is Test {
         shareAdapter.setFee(0.1 ether);
         vm.deal(address(router), 1 ether);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(uint160(address(0xCAFE)))), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(uint160(address(0xCAFE)))), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guid1"), amountUnderlying, abi.encode(r));
 
         vm.prank(ENDPOINT);
@@ -595,8 +595,8 @@ contract DStockComposerRouterTest is Test {
         MockComposerWrapperZeroShares z = new MockComposerWrapperZeroShares();
         router.setRouteConfig(address(underlyingOft), address(z), address(shareAdapter));
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guidWrapZeroUnderlyingSpent"), amountUnderlying, abi.encode(r));
 
         vm.prank(ENDPOINT);
@@ -619,8 +619,8 @@ contract DStockComposerRouterTest is Test {
         shareAdapter.setFee(0.1 ether);
         vm.deal(address(router), 1 ether);
 
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(uint160(address(0xCAFE)))), refundBsc: REFUND, minAmountLD2: 0});
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(uint160(address(0xCAFE)))), refundBsc: REFUND, minAmountLD2: 0});
         (, bytes memory message) = _compose(bytes32("guid3"), amountUnderlying, abi.encode(r));
 
         vm.prank(ENDPOINT);
@@ -649,7 +649,7 @@ contract DStockComposerRouterTest is Test {
         underlyingOft.setFee(0.05 ether);
         vm.deal(address(router), 1 ether);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -686,7 +686,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -708,7 +708,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(0),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -729,7 +729,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         // router has 0 shares; refund attempt will fail and emit RefundFailed
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -757,7 +757,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         w.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -785,7 +785,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
@@ -813,7 +813,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
@@ -847,7 +847,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(bad),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(uint256(uint160(receiver))),
@@ -875,7 +875,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: CHAIN_EID,
             finalTo: bytes32(0), // receiver == address(0)
@@ -902,7 +902,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -926,7 +926,7 @@ contract DStockComposerRouterTest is Test {
 
         underlyingOft.setFee(1 ether); // router has 0 ether => fee insufficient
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -956,7 +956,7 @@ contract DStockComposerRouterTest is Test {
         wrapper.mintShares(address(router), sharesIn);
 
         // fund router not necessary since fee=0
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(u),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -981,7 +981,7 @@ contract DStockComposerRouterTest is Test {
         uint256 sharesIn = 1000e18;
         wrapper.mintShares(address(router), sharesIn);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(badUnderlying),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(1)),
@@ -1000,15 +1000,15 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_decodeHelpers_workAndRevert() public {
-        DStockComposerRouter.RouteMsg memory r =
-            DStockComposerRouter.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 7});
-        DStockComposerRouter.RouteMsg memory r2 = router._decodeRouteMsg(abi.encode(r));
+        DStockComposerRouterV2.RouteMsg memory r =
+            DStockComposerRouterV2.RouteMsg({finalDstEid: 30367, finalTo: bytes32(uint256(1)), refundBsc: REFUND, minAmountLD2: 7});
+        DStockComposerRouterV2.RouteMsg memory r2 = router._decodeRouteMsg(abi.encode(r));
         assertEq(r2.finalDstEid, r.finalDstEid);
         assertEq(r2.finalTo, r.finalTo);
         assertEq(r2.refundBsc, r.refundBsc);
         assertEq(r2.minAmountLD2, r.minAmountLD2);
 
-        DStockComposerRouter.ReverseRouteMsg memory rr = DStockComposerRouter.ReverseRouteMsg({
+        DStockComposerRouterV2.ReverseRouteMsg memory rr = DStockComposerRouterV2.ReverseRouteMsg({
             underlying: address(underlyingOft),
             finalDstEid: 40168,
             finalTo: bytes32(uint256(123)),
@@ -1017,7 +1017,7 @@ contract DStockComposerRouterTest is Test {
             extraOptions2: hex"01",
             composeMsg2: hex"02"
         });
-        DStockComposerRouter.ReverseRouteMsg memory rr2 = router._decodeReverseRouteMsg(abi.encode(rr));
+        DStockComposerRouterV2.ReverseRouteMsg memory rr2 = router._decodeReverseRouteMsg(abi.encode(rr));
         assertEq(rr2.underlying, rr.underlying);
         assertEq(rr2.finalDstEid, rr.finalDstEid);
         assertEq(rr2.finalTo, rr.finalTo);
@@ -1062,7 +1062,7 @@ contract DStockComposerRouterTest is Test {
     }
 
     function test_upgradeToAndCall_onlyOwner() public {
-        DStockComposerRouter newImpl = new DStockComposerRouter();
+        DStockComposerRouterV2 newImpl = new DStockComposerRouterV2();
 
         vm.prank(address(0xA11CE));
         vm.expectRevert();
